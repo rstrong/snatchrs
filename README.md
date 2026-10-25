@@ -52,8 +52,9 @@ cargo run -- index --index-url https://test.pypi.org/simple/
 
 The live command requests the complete project list once, so expect a large
 response. It does not request individual package pages or download distributions.
-The `index` command does not persist results itself. There is no retry policy or
-incremental synchronization yet; `check` persists package metadata and a report.
+The `index` command does not persist results itself; `check` persists package
+metadata and a report. Network requests use the retry policy below. Incremental
+synchronization is not implemented yet.
 
 To try the parser with three packages and no network requests:
 
@@ -193,7 +194,8 @@ even when every download worker is busy; it does not wait for download slots.
 Pending jobs are spooled to a temporary JSON-lines file under the mirror root,
 and workers read them in order. The spool is per-run, not a crash-resumable queue;
 rerunning checks the files again and skips completed downloads. `--attempts`
-controls attempts per file (default 3, maximum 10). Existing files with matching
+controls attempts per index request, metadata request, or file (default 3,
+maximum 10, including the initial attempt). Existing files with matching
 sizes are skipped. Missing and wrong-sized files are deduplicated by local path
 and downloaded by a bounded worker pool. Conflicting metadata for one path fails.
 
@@ -265,6 +267,37 @@ The runner uses `snatchrs` from `PATH` unless `SNATCHRS_BIN` is provided. It rec
 `run.status` under the chosen mirror root and does not provision or format disks.
 The verification script writes `verification.json`. It reports metadata errors
 separately and returns nonzero for artifact integrity errors or download failures.
+
+## Retry policy
+
+`--attempts` applies to index requests, per-project metadata requests, and file
+downloads. It defaults to 3 total attempts, including the initial request, and
+accepts 1–10. Use `--attempts 1` to disable retries. Library callers can configure
+metadata/index attempts with `IndexClient::with_attempts(n)`.
+
+Retryable failures are connection/request timeouts, interrupted connections or
+response bodies, and HTTP **408, 429, 500, 502, 503, and 504**. Other HTTP errors
+(including 401, 403, and 404), malformed metadata, invalid paths,
+insufficient disk space, filesystem errors, and size/SHA256 mismatches fail
+immediately. Exhausted metadata failures are recorded once per package and the
+checker continues with the remaining selection.
+
+Retries use exponential backoff with jitter: the first wait is 250–500 ms,
+doubling up to a 30-second client backoff cap. A valid
+[`Retry-After`](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after) header
+on a retryable response is treated as a minimum wait, accepting either seconds
+or an HTTP date. Jittered backoff is added after that server wait, and the server
+delay is not shortened by the client cap. Invalid headers fall back to normal
+backoff; past dates add no server wait.
+
+File retries restart from zero after removing the failed temporary file and
+releasing its disk reservation. Previously published files remain intact. The
+TUI and `mirror-progress.json` identify workers waiting to retry and their delay.
+
+```bash
+./target/release/snatchrs check --mirror ./mirror-shell --package packaging --attempts 5
+./target/release/snatchrs mirror --mirror ./mirror-shell --sample 100 --attempts 5
+```
 
 ## HTTP and HTTPS proxies
 

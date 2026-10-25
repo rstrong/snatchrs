@@ -24,6 +24,9 @@ struct Cli {
     /// Disable interactive terminal progress.
     #[arg(long, global = true)]
     no_progress: bool,
+    /// Maximum attempts per index/metadata request or file (including the first).
+    #[arg(long, global = true, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=10))]
+    attempts: u32,
     #[command(subcommand)]
     command: Command,
 }
@@ -50,8 +53,10 @@ enum Command {
 fn run(cli: Cli) -> Result<()> {
     let start = Instant::now();
     let (index_url, from_file, json) = match cli.command {
-        Command::Mirror(args) => return check::run_mirror(args, cli.quiet, cli.no_progress),
-        Command::Check(args) => return check::run(args, cli.quiet, cli.no_progress),
+        Command::Mirror(args) => {
+            return check::run_mirror(args, cli.quiet, cli.no_progress, cli.attempts);
+        }
+        Command::Check(args) => return check::run(args, cli.quiet, cli.no_progress, cli.attempts),
         Command::Index {
             index_url,
             from_file,
@@ -70,7 +75,8 @@ fn run(cli: Cli) -> Result<()> {
             File::open(&path).with_context(|| format!("Failed to open {}", path.display()))?;
         PackageIndex::from_reader_with_progress(BufReader::new(file), index_url, &mut on_progress)?
     } else {
-        IndexClient::new()?.fetch_with_progress(index_url, &mut on_progress)?
+        IndexClient::with_attempts(cli.attempts)?
+            .fetch_with_progress(index_url, &mut on_progress)?
     };
     if let Some(dashboard) = &dashboard {
         dashboard.finish(index.packages.len(), start.elapsed());

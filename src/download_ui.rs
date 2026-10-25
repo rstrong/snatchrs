@@ -68,16 +68,21 @@ impl DownloadDashboard {
             .iter()
             .filter(|worker| worker.state == "downloading")
             .count();
+        let retrying = progress
+            .workers
+            .iter()
+            .filter(|worker| worker.state == "retrying")
+            .count();
         let queued = progress
             .total_files
-            .saturating_sub(progress.downloaded + progress.failed + active);
+            .saturating_sub(progress.downloaded + progress.failed + active + retrying);
         let total = if progress.discovery.finished {
             "final total"
         } else {
             "total still growing"
         };
         self.overall.set_message(format!(
-            "{queued} queued · {active} active · {} failed · {total}",
+            "{queued} queued · {active} active · {retrying} retrying · {} failed · {total}",
             progress.failed
         ));
         self.bytes.set_length(progress.total_bytes);
@@ -97,6 +102,11 @@ impl DownloadDashboard {
             bar.set_position(worker.bytes.min(worker.size));
             if worker.filename.is_empty() {
                 bar.set_message("Waiting for queued files");
+            } else if let Some(delay) = worker.retry_delay_seconds {
+                bar.set_message(format!(
+                    "retry wait ({delay:.1}s) · {} · {} (try {})",
+                    worker.package, worker.filename, worker.attempt
+                ));
             } else {
                 bar.set_message(format!(
                     "{} · {} · {} (try {})",

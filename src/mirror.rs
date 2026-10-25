@@ -56,6 +56,7 @@ impl PackageMetadata {
         layout: &MirrorLayout,
     ) -> Result<Self> {
         let raw: RawMetadata = serde_json::from_reader(BufReader::new(reader))
+            .map_err(crate::http::json_error)
             .context("Invalid per-project Simple Index JSON metadata")?;
         ensure!(
             raw.meta.api_version.split('.').next() == Some("1"),
@@ -122,16 +123,17 @@ impl IndexClient {
     ) -> Result<PackageMetadata> {
         let base = normalize_index_url(metadata_base)?;
         let url = base.join(&format!("{}/", normalize_name(&package.name)?))?;
-        let response = self
-            .client
-            .get(url.clone())
-            .header(reqwest::header::ACCEPT, JSON_MEDIA_TYPE)
-            .send()
-            .context("Failed to fetch project metadata")?
-            .error_for_status()
-            .context("Project metadata returned an HTTP error")?;
-        let effective_url = response.url().clone();
-        PackageMetadata::from_reader(response, package, effective_url, layout)
+        crate::http::get(
+            &self.client,
+            &url,
+            JSON_MEDIA_TYPE,
+            self.attempts,
+            |response| {
+                let effective_url = response.url().clone();
+                PackageMetadata::from_reader(response, package.clone(), effective_url, layout)
+            },
+        )
+        .context("Failed to fetch project metadata")
     }
 }
 

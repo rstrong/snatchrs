@@ -64,26 +64,24 @@ pub struct MirrorArgs {
     /// Simultaneous download workers (1–64).
     #[arg(short = 'j', long, alias = "threads", default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
     concurrency: u16,
-    /// Maximum attempts per file, including the initial attempt.
-    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=10))]
-    attempts: u32,
 }
 
-pub fn run_mirror(args: MirrorArgs, quiet: bool, no_progress: bool) -> Result<()> {
+pub fn run_mirror(args: MirrorArgs, quiet: bool, no_progress: bool, attempts: u32) -> Result<()> {
     run_inner(
         args.selection,
         quiet,
         no_progress,
         Some(snatchrs::download::DownloadOptions {
             concurrency: usize::from(args.concurrency),
-            attempts: args.attempts,
+            attempts,
             ..Default::default()
         }),
+        attempts,
     )
 }
 
-pub fn run(args: CheckArgs, quiet: bool, no_progress: bool) -> Result<()> {
-    run_inner(args, quiet, no_progress, None)
+pub fn run(args: CheckArgs, quiet: bool, no_progress: bool, attempts: u32) -> Result<()> {
+    run_inner(args, quiet, no_progress, None, attempts)
 }
 
 fn run_inner(
@@ -91,13 +89,14 @@ fn run_inner(
     quiet: bool,
     no_progress: bool,
     download: Option<snatchrs::download::DownloadOptions>,
+    attempts: u32,
 ) -> Result<()> {
     let start = Instant::now();
     let interactive = crate::interactive(quiet, no_progress, args.json);
     let mut dashboard = interactive.then(crate::progress::Dashboard::new);
     let layout = MirrorLayout::create(&args.mirror)?;
     let _lock = layout.lock()?;
-    let client = IndexClient::new()?;
+    let client = IndexClient::with_attempts(attempts)?;
     let metadata_url = args
         .metadata_url
         .clone()

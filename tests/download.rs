@@ -627,7 +627,7 @@ fn queued_artifact_size_does_not_stop_checking_and_active_space_failures_are_rep
     huge.size = u64::MAX;
     let (checked, report) = snatchrs::download::download_stream(
         directory.path(),
-        options(1, 1),
+        options(1, 5),
         |queue| {
             queue.enqueue(huge)?;
             Ok("checker continued")
@@ -637,6 +637,7 @@ fn queued_artifact_size_does_not_stop_checking_and_active_space_failures_are_rep
     .unwrap();
     assert_eq!(checked, "checker continued");
     assert_eq!(report.progress.failed, 1);
+    assert_eq!(report.outcomes[0].attempts, 1);
     assert!(
         report.outcomes[0]
             .error

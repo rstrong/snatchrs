@@ -95,7 +95,7 @@ fn requests_json_and_handles_http_errors() {
             write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/vnd.pypi.simple.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             String::from_utf8(request).unwrap()
         });
-        let result = snatchrs::IndexClient::new().unwrap().fetch(url);
+        let result = snatchrs::IndexClient::with_attempts(1).unwrap().fetch(url);
         let request = server.join().unwrap().to_ascii_lowercase();
         assert!(request.starts_with("get /simple/ http/1.1\r\n"));
         assert!(request.contains("accept: application/vnd.pypi.simple.v1+json\r\n"));

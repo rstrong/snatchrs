@@ -87,6 +87,7 @@ pub struct WorkerProgress {
     pub size: u64,
     pub attempt: u32,
     pub state: String,
+    pub retry_delay_seconds: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -145,6 +146,10 @@ enum Event {
     Bytes {
         worker: usize,
         bytes: u64,
+    },
+    Retrying {
+        worker: usize,
+        delay: Duration,
     },
     Finished {
         worker: usize,
@@ -466,10 +471,18 @@ fn stream_with_workers<T: Send>(
                                 outcome.error = None;
                                 break;
                             }
-                            Err(error) => outcome.error = Some(format!("{error:#}")),
-                        }
-                        if attempt < options.attempts {
-                            thread::sleep(Duration::from_millis(250 * u64::from(attempt)));
+                            Err(error) => {
+                                outcome.error = Some(format!("{error:#}"));
+                                let Some(delay) =
+                                    crate::http::retry_delay(attempt, options.attempts, &error)
+                                else {
+                                    break;
+                                };
+                                if events.send(Event::Retrying { worker, delay }).is_err() {
+                                    return Ok(());
+                                }
+                                thread::sleep(delay);
+                            }
                         }
                     }
                     if events
@@ -521,11 +534,17 @@ fn stream_with_workers<T: Send>(
                             size,
                             attempt,
                             state: "downloading".into(),
+                            retry_delay_seconds: None,
                         };
                     }
                     Event::Bytes { worker, bytes } => {
                         state.workers[worker].bytes += bytes;
                         state.transferred_bytes += bytes;
+                    }
+                    Event::Retrying { worker, delay } => {
+                        state.workers[worker].state = "retrying".into();
+                        state.workers[worker].retry_delay_seconds = Some(delay.as_secs_f64());
+                        state.workers[worker].bytes = 0;
                     }
                     Event::Finished { worker, outcome } => {
                         if outcome.downloaded {
@@ -585,11 +604,12 @@ fn download_one(client: &Client, task: &DownloadTask, mut progress: impl FnMut(u
     let mut temporary = tempfile::Builder::new()
         .prefix(".snatchrs-")
         .tempfile_in(parent)?;
-    let mut response = client
+    let response = client
         .get(task.download_url.clone())
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
-        .send()?
-        .error_for_status()?;
+        .send()
+        .map_err(crate::http::request_error)?;
+    let mut response = crate::http::check_response(response)?;
     if let Some(length) = response.content_length() {
         ensure!(
             length == task.size,
@@ -603,7 +623,9 @@ fn download_one(client: &Client, task: &DownloadTask, mut progress: impl FnMut(u
     let mut buffer = [0u8; 65536];
     let result = (|| -> Result<()> {
         loop {
-            let size = response.read(&mut buffer)?;
+            let size = response
+                .read(&mut buffer)
+                .map_err(crate::http::read_error)?;
             if size == 0 {
                 break;
             }

@@ -153,6 +153,7 @@ fn reply(mode: Mode, address: SocketAddr, request: &str) -> (&'static str, Vec<u
 
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_snatchrs"));
+    command.args(["--attempts", "1"]);
     for name in PROXY_ENV {
         command.env_remove(name);
     }
@@ -170,8 +171,6 @@ fn mirror(root: &Path, base: &str, metadata: &str) -> Command {
             "42",
             "--concurrency",
             "2",
-            "--attempts",
-            "1",
             "--json",
             "--index-url",
             base,

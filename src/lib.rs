@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use reqwest::{blocking::Client, header::ACCEPT};
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -67,6 +67,7 @@ impl PackageIndex {
             progress: &mut progress,
         };
         let raw: RawIndex = serde_json::from_reader(BufReader::new(reader))
+            .map_err(http::json_error)
             .context("Failed to parse the Simple Index JSON response")?;
         ensure!(
             raw.meta.api_version.split('.').next() == Some("1"),
@@ -124,15 +125,25 @@ impl<'a> IntoIterator for &'a PackageIndex {
 /// Reuse one HTTP client across future discovery and metadata operations.
 pub struct IndexClient {
     client: Client,
+    attempts: u32,
 }
 
 impl IndexClient {
     pub fn new() -> Result<Self> {
+        Self::with_attempts(http::DEFAULT_ATTEMPTS)
+    }
+
+    pub fn with_attempts(attempts: u32) -> Result<Self> {
+        ensure!(
+            (1..=10).contains(&attempts),
+            "Request attempts must be between 1 and 10"
+        );
         Ok(Self {
             client: http::client_builder()
                 .timeout(Duration::from_secs(180))
                 .gzip(true)
                 .build()?,
+            attempts,
         })
     }
 
@@ -143,19 +154,20 @@ impl IndexClient {
     pub fn fetch_with_progress(
         &self,
         index_url: Url,
-        progress: impl FnMut(IndexProgress<'_>),
+        mut progress: impl FnMut(IndexProgress<'_>),
     ) -> Result<PackageIndex> {
         let index_url = normalize_index_url(index_url)?;
-        let response = self
-            .client
-            .get(index_url.clone())
-            .header(ACCEPT, JSON_MEDIA_TYPE)
-            .send()
-            .context("Failed to fetch the package index")?
-            .error_for_status()
-            .context("Package index returned an HTTP error")?;
-        let effective_url = response.url().clone();
-        PackageIndex::from_reader_with_progress(response, effective_url, progress)
+        http::get(
+            &self.client,
+            &index_url,
+            JSON_MEDIA_TYPE,
+            self.attempts,
+            |response| {
+                let effective_url = response.url().clone();
+                PackageIndex::from_reader_with_progress(response, effective_url, &mut progress)
+            },
+        )
+        .context("Failed to fetch the package index")
     }
 }
 
