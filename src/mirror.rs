@@ -117,6 +117,14 @@ impl PackageMetadata {
     }
 }
 
+/// Project discovery can race with deletion, or an explicitly named project
+/// may not exist. Neither case is a failed inspection of an available project.
+#[derive(Debug)]
+pub enum MetadataOutcome {
+    Available(Box<PackageMetadata>),
+    NotFound { metadata_url: Url },
+}
+
 impl IndexClient {
     /// Reuse valid same-source metadata only when its project serial matches the
     /// current root listing. A serial never proves that local artifacts exist.
@@ -126,7 +134,7 @@ impl IndexClient {
         metadata_base: Url,
         layout: &MirrorLayout,
         refresh: bool,
-    ) -> Result<PackageMetadata> {
+    ) -> Result<MetadataOutcome> {
         let source = normalize_index_url(metadata_base.clone())?
             .join(&format!("{}/", normalize_name(&package.name)?))?;
         if !refresh
@@ -135,11 +143,30 @@ impl IndexClient {
         {
             // Preserve current root-index knowledge when reusing project data.
             metadata.package = package;
-            return Ok(metadata);
+            return Ok(MetadataOutcome::Available(Box::new(metadata)));
         }
-        let metadata = self.fetch_metadata(package, metadata_base, layout)?;
-        layout.save_metadata(&metadata)?;
-        Ok(metadata)
+        let name = package.normalized_name.clone();
+        match self.fetch_metadata(package, metadata_base, layout) {
+            Ok(metadata) => {
+                layout.save_metadata(&metadata)?;
+                Ok(MetadataOutcome::Available(Box::new(metadata)))
+            }
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(|error| error.status() == Some(reqwest::StatusCode::NOT_FOUND))
+                }) =>
+            {
+                // An observed deletion must not leave metadata eligible for a
+                // future serial-cache hit. Never remove local distributions.
+                layout.invalidate_metadata(&name)?;
+                Ok(MetadataOutcome::NotFound {
+                    metadata_url: source,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// One per-project Simple JSON request covers all advertised files/versions.
@@ -239,6 +266,18 @@ impl MirrorLayout {
         // Retain the normal directory/symlink checks even on a cache hit.
         create_directory(&package_path).ok()?;
         Some(metadata)
+    }
+
+    fn invalidate_metadata(&self, name: &str) -> Result<()> {
+        let name = normalize_name(name)?;
+        let path = self.root.join("metadata").join(format!("{name}.json"));
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).context("Cannot invalidate unavailable project's metadata cache")
+            }
+        }
     }
 
     pub fn save_metadata(&self, metadata: &PackageMetadata) -> Result<()> {

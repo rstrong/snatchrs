@@ -45,6 +45,7 @@ def main():
     result = {
         "selected_names": len(report["inspection"]["selected_packages"]),
         "metadata_packages": metadata_packages,
+        "unavailable_projects": report["inspection"].get("unavailable_count", 0),
         "metadata_errors": [json.loads(line) for line in Path(report["inspection"]["errors_path"]).read_text().splitlines()],
         "checked_files": len(checked), "sha256_verified_files": hashed,
         "verified_bytes": verified_bytes, "failures": failures,

@@ -20,6 +20,7 @@ impl Dashboard {
         total: usize,
         name: &str,
         summary: &snatchrs::mirror::CheckSummary,
+        unavailable: usize,
     ) {
         self.bar.set_style(style(
             "{spinner:.cyan} {prefix:.bold}  {elapsed_precise}\n  {wide_bar:.cyan/blue} {percent:>3}%\n  {human_pos} / {human_len} packages\n  {msg}",
@@ -28,7 +29,7 @@ impl Dashboard {
         self.bar.set_length(total as u64);
         self.bar.set_position(processed as u64);
         self.bar.set_message(format!(
-            "Current: {name}\n  {} releases · {} files · {} missing · {} size mismatches",
+            "Current: {name}\n  {} releases · {} files · {} missing · {} size mismatches · {unavailable} unavailable projects",
             summary.releases, summary.files, summary.missing, summary.size_mismatch
         ));
     }
@@ -37,11 +38,12 @@ impl Dashboard {
         &self,
         summary: &snatchrs::mirror::CheckSummary,
         errors: usize,
+        unavailable: usize,
         elapsed: Duration,
     ) {
         self.bar.set_style(style("{msg}"));
         self.bar.finish_with_message(format!(
-            "Checked {} packages · {} releases · {} files in {:.2}s\n  {} missing · {} size mismatches · {} matching sizes\n  {} blocked files · {errors} package errors\n  Download queue stub: {} candidates; no downloads performed",
+            "Checked {} packages · {} releases · {} files in {:.2}s\n  {} missing · {} size mismatches · {} matching sizes\n  {} blocked files · {errors} package errors · {unavailable} unavailable projects\n  Download queue stub: {} candidates; no downloads performed",
             summary.packages, summary.releases, summary.files, elapsed.as_secs_f64(), summary.missing, summary.size_mismatch, summary.matching_size, summary.blocked, summary.missing + summary.size_mismatch,
         ));
     }

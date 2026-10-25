@@ -167,6 +167,14 @@ Explicit `--package` selection does not fetch the root listing and therefore
 always fetches metadata. Failed refreshes report an error and preserve the previous
 cache; they do not silently fall back to potentially stale metadata.
 
+A project's metadata endpoint returning HTTP 404 is recorded separately as
+`not_found`, counted in `unavailable_count`, and skipped without retrying. This
+covers deleted projects still present in a cached root listing and names that do
+not exist. Such outcomes do not increment `error_count` or cause a nonzero exit;
+other projects are still checked and downloaded. An observed 404 invalidates only
+that project's metadata cache, preserving local distribution files. Other HTTP
+errors, a 404 for the root index, and missing distribution downloads remain errors.
+
 The API's flat `files` list supplies URLs, sizes, `hashes`, `requires-python`, and
 boolean or string `yanked` values. Relative file URLs are resolved against the
 final response URL, including redirects. Files are grouped into the advertised
@@ -239,7 +247,7 @@ discovery continues. A filesystem lock prevents simultaneous
 size only; their hashes are not revalidated on subsequent runs.
 
 In one terminal display, progress includes packages checked and the current name,
-metadata errors, files discovered, queued/active downloads, byte counts, transfer
+metadata errors, unavailable projects, files discovered, queued/active downloads, byte counts, transfer
 speed, and a progress line for each worker with package/filename/attempt. Download
 totals grow during discovery, so the UI labels them as provisional until checking
 finishes. Workers and live progress remain responsive during slow metadata requests.
@@ -253,6 +261,7 @@ Saved files include:
 - `mirror-report.json`: inspection summary, download counters, `downloads.outcomes_path`, and final size checks.
 - `reports/run-*/checked-packages.jsonl`: one checked package per line, including metadata and initial file states (`inspection.packages_path`).
 - `reports/run-*/package-errors.jsonl`: one metadata/queue error per line (`inspection.errors_path`).
+- `reports/run-*/unavailable-projects.jsonl`: one project metadata 404 per line, with name, requested metadata URL, `status: "not_found"`, and `http_status: 404` (`inspection.unavailable_path`).
 - `reports/run-*/download-outcomes.jsonl`: one completed download outcome per line, including failures.
 
 Both `check` and `mirror` append details as work completes, rather than retaining

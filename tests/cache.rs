@@ -19,6 +19,9 @@ struct State {
     project_serial: Option<u64>,
     header_serial: Option<u64>,
     metadata_status: u16,
+    index_status: u16,
+    artifact_status: u16,
+    artifact_requests: usize,
     metadata_requests: usize,
 }
 struct Server {
@@ -37,6 +40,9 @@ impl Server {
             project_serial: Some(100),
             header_serial: None,
             metadata_status: 200,
+            index_status: 200,
+            artifact_status: 200,
+            artifact_requests: 0,
             metadata_requests: 0,
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -73,12 +79,13 @@ impl Server {
                         project["_last-serial"] = serial.into();
                     }
                     (
-                        200,
+                        state.index_status,
                         serde_json::json!({"meta": {"api-version": "1.4"}, "projects": [project]})
                             .to_string(),
                     )
                 } else if path == "/artifact" {
-                    (200, "hello".to_owned())
+                    state.artifact_requests += 1;
+                    (state.artifact_status, "hello".to_owned())
                 } else {
                     assert!(path.ends_with("/cache-fixture/"), "{path}");
                     state.metadata_requests += 1;
@@ -296,4 +303,113 @@ fn cached_metadata_does_not_bypass_symlink_directory_checks() {
     assert!(!output.status.success());
     assert_eq!(server.requests(), before + 1);
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn project_404_is_an_outcome_and_invalidates_only_metadata_cache() {
+    let server = Server::start();
+    let root = tempdir().unwrap();
+    server.run(root.path(), "mirror", &[], 1);
+    let artifact = root
+        .path()
+        .join("packages/cache-fixture/cache_fixture-1.0.tar.gz");
+    let cached = root.path().join("metadata/cache-fixture.json");
+    server.state.lock().unwrap().metadata_status = 404;
+    // Force observation of a deletion even if a stale root index still reports
+    // the old serial. Subsequent runs must not reuse the now-invalid cache.
+    for (mode, extra) in [
+        ("mirror", vec!["--refresh"]),
+        ("check", vec![]),
+        ("mirror", vec![]),
+    ] {
+        let report = server.run(root.path(), mode, &extra, 1);
+        let inspection = if mode == "mirror" {
+            &report["inspection"]
+        } else {
+            &report
+        };
+        assert_eq!(inspection["error_count"], 0);
+        assert_eq!(inspection["unavailable_count"], 1);
+        assert_eq!(inspection["summary"]["packages"], 0);
+        assert!(
+            fs::read_to_string(inspection["errors_path"].as_str().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fs::read_to_string(inspection["packages_path"].as_str().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        let records = fs::read_to_string(inspection["unavailable_path"].as_str().unwrap()).unwrap();
+        assert_eq!(records.lines().count(), 1);
+        let record: serde_json::Value =
+            serde_json::from_str(records.lines().next().unwrap()).unwrap();
+        assert_eq!(record["name"], "cache-fixture");
+        assert_eq!(record["status"], "not_found");
+        assert_eq!(record["http_status"], 404);
+        assert_eq!(
+            record["metadata_url"],
+            format!("{}/simple/cache-fixture/", server.base)
+        );
+        if mode == "mirror" {
+            assert_eq!(report["downloads"]["progress"]["failed"], 0);
+            assert_eq!(report["downloads"]["progress"]["total_files"], 0);
+            assert_eq!(
+                report["downloads"]["progress"]["discovery"]["checked_packages"],
+                1
+            );
+            assert_eq!(
+                report["downloads"]["progress"]["discovery"]["unavailable"],
+                1
+            );
+            assert_eq!(report["downloads"]["progress"]["discovery"]["errors"], 0);
+        }
+        assert!(!cached.exists());
+        assert_eq!(fs::read(&artifact).unwrap(), b"hello");
+    }
+    server.state.lock().unwrap().metadata_status = 200;
+    let report = server.run(root.path(), "mirror", &[], 1);
+    assert_eq!(report["inspection"]["unavailable_count"], 0);
+    assert_eq!(report["final_check"]["matching_size"], 1);
+    assert!(cached.is_file());
+}
+
+#[test]
+fn other_metadata_errors_and_non_project_404s_still_fail() {
+    let server = Server::start();
+    let root = tempdir().unwrap();
+    for status in [403, 410, 500] {
+        server.state.lock().unwrap().metadata_status = status;
+        for mode in ["check", "mirror"] {
+            let before = server.requests();
+            let output = server.command(root.path(), mode, &[]);
+            assert!(!output.status.success());
+            assert_eq!(server.requests(), before + 1);
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let inspection = if mode == "mirror" {
+                &report["inspection"]
+            } else {
+                &report
+            };
+            assert_eq!(inspection["unavailable_count"], 0);
+            assert_eq!(inspection["error_count"], 1);
+        }
+    }
+    server.state.lock().unwrap().metadata_status = 200;
+    server.state.lock().unwrap().artifact_status = 404;
+    let output = server.command(root.path(), "mirror", &[]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["inspection"]["error_count"], 0);
+    assert_eq!(report["inspection"]["unavailable_count"], 0);
+    assert_eq!(report["downloads"]["progress"]["failed"], 1);
+    assert_eq!(server.state.lock().unwrap().artifact_requests, 1);
+    server.state.lock().unwrap().index_status = 404;
+    let before = server.requests();
+    let output = server.command(root.path(), "mirror", &[]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("404"));
+    assert!(output.stdout.is_empty());
+    assert_eq!(server.requests(), before);
 }

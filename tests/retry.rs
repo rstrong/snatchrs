@@ -384,3 +384,58 @@ fn active_download_can_outlast_read_timeout() {
     assert_eq!(fs::read(root.path().join("artifact.whl")).unwrap(), body);
     assert_eq!(server.count(), 1);
 }
+
+#[test]
+fn project_404_is_not_retried_and_later_projects_are_still_checked() {
+    for mode in ["check", "mirror"] {
+        let server = Server::start(vec![
+            Reply::new(404, b"deleted"),
+            Reply::new(200, METADATA.as_bytes()),
+        ]);
+        let root = tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
+            .args([
+                mode,
+                "--package",
+                "gone",
+                "--package",
+                "retry-fixture",
+                "--attempts",
+                "5",
+                "--metadata-url",
+                &format!("{}/simple/", server.url),
+                "--json",
+                "--quiet",
+                "--mirror",
+            ])
+            .arg(root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(server.count(), 2);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let inspection = if mode == "mirror" {
+            &report["inspection"]
+        } else {
+            &report
+        };
+        assert_eq!(inspection["unavailable_count"], 1);
+        assert_eq!(inspection["error_count"], 0);
+        assert_eq!(inspection["summary"]["packages"], 1);
+        if mode == "mirror" {
+            assert_eq!(
+                report["downloads"]["progress"]["discovery"]["checked_packages"],
+                2
+            );
+            assert_eq!(
+                report["downloads"]["progress"]["discovery"]["unavailable"],
+                1
+            );
+            assert_eq!(report["final_check"]["packages"], 1);
+        }
+    }
+}

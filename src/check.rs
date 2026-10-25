@@ -11,8 +11,8 @@ use serde::Serialize;
 use snatchrs::{
     DEFAULT_INDEX_URL, IndexClient, IndexProgress, Package,
     mirror::{
-        CheckSummary, CheckedPackage, DownloadQueueStub, MirrorLayout, check_package,
-        sample_packages, write_json,
+        CheckSummary, CheckedPackage, DownloadQueueStub, MetadataOutcome, MirrorLayout,
+        check_package, sample_packages, write_json,
     },
 };
 use url::Url;
@@ -60,6 +60,8 @@ struct CheckReport {
     packages_path: PathBuf,
     errors_path: PathBuf,
     error_count: usize,
+    unavailable_path: PathBuf,
+    unavailable_count: usize,
 }
 
 // Each run owns its detail files so atomic summary replacement never points an
@@ -67,6 +69,7 @@ struct CheckReport {
 struct InspectionJournal {
     packages: BufWriter<File>,
     errors: BufWriter<File>,
+    unavailable: BufWriter<File>,
 }
 
 fn append_jsonl(file: &mut BufWriter<File>, value: &impl Serialize) -> Result<()> {
@@ -83,6 +86,23 @@ fn record_error(
 ) -> Result<()> {
     append_jsonl(&mut journal.errors, &error)?;
     report.error_count += 1;
+    Ok(())
+}
+
+fn record_unavailable(
+    report: &mut CheckReport,
+    journal: &mut InspectionJournal,
+    name: &str,
+    metadata_url: Url,
+) -> Result<()> {
+    append_jsonl(
+        &mut journal.unavailable,
+        &serde_json::json!({
+            "name": name, "status": "not_found", "http_status": 404,
+            "metadata_url": metadata_url,
+        }),
+    )?;
+    report.unavailable_count += 1;
     Ok(())
 }
 
@@ -182,9 +202,11 @@ fn run_inner(
         .keep();
     let packages_path = run_dir.join("checked-packages.jsonl");
     let errors_path = run_dir.join("package-errors.jsonl");
+    let unavailable_path = run_dir.join("unavailable-projects.jsonl");
     let mut journal = InspectionJournal {
         packages: BufWriter::new(File::create(&packages_path)?),
         errors: BufWriter::new(File::create(&errors_path)?),
+        unavailable: BufWriter::new(File::create(&unavailable_path)?),
     };
     let mut report = CheckReport {
         mirror_root: layout.root.clone(),
@@ -198,6 +220,8 @@ fn run_inner(
         packages_path,
         errors_path,
         error_count: 0,
+        unavailable_path,
+        unavailable_count: 0,
     };
     if let Some(options) = download {
         if let Some(dashboard) = &dashboard {
@@ -222,13 +246,22 @@ fn run_inner(
     for (position, package) in packages.into_iter().enumerate() {
         let name = package.normalized_name.clone();
         if let Some(dashboard) = &dashboard {
-            dashboard.checking(position, total, &name, &report.summary);
+            dashboard.checking(
+                position,
+                total,
+                &name,
+                &report.summary,
+                report.unavailable_count,
+            );
         }
         let result = client.load_metadata(package, metadata_url.clone(), &layout, args.refresh);
         match result {
-            Ok(metadata) => {
-                let checked = check_package(metadata, &mut report.summary, &mut report.queue_stub);
+            Ok(MetadataOutcome::Available(metadata)) => {
+                let checked = check_package(*metadata, &mut report.summary, &mut report.queue_stub);
                 append_jsonl(&mut journal.packages, &checked)?;
+            }
+            Ok(MetadataOutcome::NotFound { metadata_url }) => {
+                record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
             }
             Err(error) => record_error(
                 &mut report,
@@ -240,15 +273,27 @@ fn run_inner(
             )?,
         }
         if let Some(dashboard) = &dashboard {
-            dashboard.checking(position + 1, total, &name, &report.summary);
+            dashboard.checking(
+                position + 1,
+                total,
+                &name,
+                &report.summary,
+                report.unavailable_count,
+            );
         }
     }
     journal.packages.get_ref().sync_all()?;
     journal.errors.get_ref().sync_all()?;
+    journal.unavailable.get_ref().sync_all()?;
     let report_path = layout.root.join("check-report.json");
     write_json(&report_path, &report)?;
     if let Some(dashboard) = &dashboard {
-        dashboard.finish_check(&report.summary, report.error_count, start.elapsed());
+        dashboard.finish_check(
+            &report.summary,
+            report.error_count,
+            report.unavailable_count,
+            start.elapsed(),
+        );
     }
     if !quiet {
         eprintln!("Report: {}", report_path.display());
@@ -284,7 +329,7 @@ fn run_inner(
         })?;
         writeln!(
             stdout,
-            "Checked {} packages, {} releases, {} files · {} missing, {} size mismatches, {} matching sizes, {} blocked · {} package errors",
+            "Checked {} packages, {} releases, {} files · {} missing, {} size mismatches, {} matching sizes, {} blocked · {} package errors · {} unavailable projects",
             report.summary.packages,
             report.summary.releases,
             report.summary.files,
@@ -292,7 +337,8 @@ fn run_inner(
             report.summary.size_mismatch,
             report.summary.matching_size,
             report.summary.blocked,
-            report.error_count
+            report.error_count,
+            report.unavailable_count
         )?;
         writeln!(
             stdout,
@@ -391,12 +437,13 @@ fn run_pipeline(
             }
             if ui.is_none() && !quiet && log_time.elapsed() >= Duration::from_secs(5) {
                 eprintln!(
-                    "Checked {}/{} packages · downloaded {}/{} discovered files · {} failed · {:.1} MiB transferred",
+                    "Checked {}/{} packages · downloaded {}/{} discovered files · {} failed · {} unavailable projects · {:.1} MiB transferred",
                     progress.discovery.checked_packages,
                     progress.discovery.total_packages,
                     progress.downloaded,
                     progress.total_files,
                     progress.failed,
+                    progress.discovery.unavailable,
                     progress.transferred_bytes as f64 / 1_048_576.0
                 );
                 log_time = Instant::now();
@@ -438,11 +485,12 @@ fn run_pipeline(
     } else if ui.is_none() {
         writeln!(
             stdout,
-            "Downloaded {} files · {} failed · {} files with matching sizes · {} inspection errors",
+            "Downloaded {} files · {} failed · {} files with matching sizes · {} inspection errors · {} unavailable projects",
             downloads.progress.downloaded,
             downloads.progress.failed,
             report.final_check.matching_size,
-            inspection.error_count
+            inspection.error_count,
+            inspection.unavailable_count
         )?;
     }
     stdout.flush()?;
@@ -483,6 +531,7 @@ fn discovery(
         missing: report.summary.missing,
         size_mismatch: report.summary.size_mismatch,
         errors: report.error_count,
+        unavailable: report.unavailable_count,
         finished: false,
     }
 }
@@ -505,8 +554,8 @@ fn inspect_stream(
         let result = client.load_metadata(package, metadata_url.clone(), layout, refresh);
         let mut stop = false;
         match result {
-            Ok(metadata) => {
-                let checked = check_package(metadata, &mut report.summary, &mut report.queue_stub);
+            Ok(MetadataOutcome::Available(metadata)) => {
+                let checked = check_package(*metadata, &mut report.summary, &mut report.queue_stub);
                 let tasks = snatchrs::download::build_tasks(std::slice::from_ref(&checked));
                 append_jsonl(&mut journal.packages, &checked)?;
                 let queued = tasks.and_then(|tasks| {
@@ -527,6 +576,9 @@ fn inspect_stream(
                     stop = true;
                 }
             }
+            Ok(MetadataOutcome::NotFound { metadata_url }) => {
+                record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
+            }
             Err(error) => record_error(
                 &mut report,
                 &mut journal,
@@ -543,6 +595,7 @@ fn inspect_stream(
     }
     journal.packages.get_ref().sync_all()?;
     journal.errors.get_ref().sync_all()?;
+    journal.unavailable.get_ref().sync_all()?;
     write_json(&layout.root.join("check-report.json"), &report)?;
     Ok(report)
 }

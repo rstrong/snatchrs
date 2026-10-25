@@ -57,8 +57,10 @@ impl DownloadDashboard {
             "checking"
         };
         self.checking.set_message(format!(
-            "{phase} · {} · {} metadata/queue errors",
-            progress.discovery.current_package, progress.discovery.errors
+            "{phase} · {} · {} metadata/queue errors · {} unavailable projects",
+            progress.discovery.current_package,
+            progress.discovery.errors,
+            progress.discovery.unavailable
         ));
         self.overall.set_length(progress.total_files as u64);
         self.overall
@@ -124,10 +126,11 @@ impl DownloadDashboard {
         self.checking.finish_and_clear();
         self.overall.set_style(style("{msg}"));
         self.overall.finish_with_message(format!(
-            "Checked {}/{} packages · {} metadata/queue errors\nDownloaded {} files · {} failed · {:.2} MiB verified in {:.1}s",
+            "Checked {}/{} packages · {} metadata/queue errors · {} unavailable projects\nDownloaded {} files · {} failed · {:.2} MiB verified in {:.1}s",
             progress.discovery.checked_packages,
             progress.discovery.total_packages,
             progress.discovery.errors,
+            progress.discovery.unavailable,
             progress.downloaded,
             progress.failed,
             progress.verified_bytes as f64 / 1_048_576.0,

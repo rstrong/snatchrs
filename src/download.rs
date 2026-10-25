@@ -101,6 +101,7 @@ pub struct DiscoveryProgress {
     pub missing: usize,
     pub size_mismatch: usize,
     pub errors: usize,
+    pub unavailable: usize,
     pub finished: bool,
 }
 

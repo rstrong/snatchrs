@@ -9,8 +9,8 @@ use std::{
 use snatchrs::{
     IndexClient, Package, PackageIndex,
     mirror::{
-        CheckSummary, DownloadQueueStub, FileState, MirrorLayout, PackageMetadata, check_package,
-        inspect_file, sample_packages,
+        CheckSummary, DownloadQueueStub, FileState, MetadataOutcome, MirrorLayout, PackageMetadata,
+        check_package, inspect_file, sample_packages,
     },
 };
 use tempfile::tempdir;
@@ -262,6 +262,9 @@ fn fetches_simple_json_and_resolves_files_against_redirected_page() {
             false,
         )
         .unwrap();
+    let MetadataOutcome::Available(cached) = cached else {
+        panic!("cached project unavailable")
+    };
     assert_eq!(cached.metadata_url, metadata.metadata_url);
     assert_eq!(
         cached.releases[0].files[0].download_url,
@@ -402,7 +405,7 @@ fn random_sample_is_unique_and_reproducible() {
 
 // Exercise the real CLI against a local HTTP server, with no artifact endpoint.
 #[test]
-fn cli_saves_metadata_and_report_and_continues_after_package_errors() {
+fn cli_saves_metadata_and_report_and_continues_after_unavailable_project() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/simple/", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
@@ -454,17 +457,27 @@ fn cli_saves_metadata_and_report_and_continues_after_package_errors() {
         .arg(directory.path())
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["summary"]["packages"], 1);
     assert_eq!(report["summary"]["releases"], 3);
     assert_eq!(report["summary"]["missing"], 4);
     assert_eq!(report["queue_stub"]["candidates_seen"], 4);
-    assert_eq!(report["error_count"], 1);
+    assert_eq!(report["error_count"], 0);
+    assert_eq!(report["unavailable_count"], 1);
     assert!(report.get("packages").is_none());
     let errors = fs::read_to_string(report["errors_path"].as_str().unwrap()).unwrap();
-    let error: serde_json::Value = serde_json::from_str(errors.lines().next().unwrap()).unwrap();
-    assert_eq!(error["name"], "gone");
+    assert!(errors.is_empty());
+    let unavailable = fs::read_to_string(report["unavailable_path"].as_str().unwrap()).unwrap();
+    let outcome: serde_json::Value =
+        serde_json::from_str(unavailable.lines().next().unwrap()).unwrap();
+    assert_eq!(outcome["name"], "gone");
+    assert_eq!(outcome["status"], "not_found");
+    assert_eq!(outcome["http_status"], 404);
     let packages = fs::read_to_string(report["packages_path"].as_str().unwrap()).unwrap();
     let checked: snatchrs::mirror::CheckedPackage =
         serde_json::from_str(packages.lines().next().unwrap()).unwrap();
