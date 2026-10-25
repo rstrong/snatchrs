@@ -32,7 +32,7 @@ pub enum IndexProgress<'a> {
 }
 
 /// Knowledge available about a package from the root Simple Index.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
     pub name: String,
     pub normalized_name: String,

@@ -19,13 +19,13 @@ use crate::{
 pub const DEFAULT_METADATA_URL: &str = crate::DEFAULT_INDEX_URL;
 
 /// A release can contain many wheels and source distributions, or no files.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Release {
     pub version: String,
     pub files: Vec<DistributionFile>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DistributionFile {
     pub filename: String,
     pub download_url: Url,
@@ -37,7 +37,7 @@ pub struct DistributionFile {
     pub yanked: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PackageMetadata {
     pub package: Package,
     pub metadata_url: Url,
@@ -205,7 +205,7 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum FileState {
     Missing,
@@ -235,7 +235,7 @@ pub fn inspect_file(file: &DistributionFile) -> FileState {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CheckedFile {
     pub version: String,
     pub filename: String,
@@ -244,7 +244,7 @@ pub struct CheckedFile {
     pub state: FileState,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CheckedPackage {
     pub metadata: PackageMetadata,
     pub files: Vec<CheckedFile>,

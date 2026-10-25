@@ -440,7 +440,16 @@ fn cli_saves_metadata_and_report_and_continues_after_package_errors() {
     assert_eq!(report["summary"]["releases"], 3);
     assert_eq!(report["summary"]["missing"], 4);
     assert_eq!(report["queue_stub"]["candidates_seen"], 4);
-    assert_eq!(report["errors"][0]["name"], "gone");
+    assert_eq!(report["error_count"], 1);
+    assert!(report.get("packages").is_none());
+    let errors = fs::read_to_string(report["errors_path"].as_str().unwrap()).unwrap();
+    let error: serde_json::Value = serde_json::from_str(errors.lines().next().unwrap()).unwrap();
+    assert_eq!(error["name"], "gone");
+    let packages = fs::read_to_string(report["packages_path"].as_str().unwrap()).unwrap();
+    let checked: snatchrs::mirror::CheckedPackage =
+        serde_json::from_str(packages.lines().next().unwrap()).unwrap();
+    assert_eq!(checked.files.len(), 4);
+    assert_eq!(packages.lines().count(), 1);
     assert!(directory.path().join("metadata/example-pkg.json").is_file());
     assert!(directory.path().join("check-report.json").is_file());
     assert_eq!(

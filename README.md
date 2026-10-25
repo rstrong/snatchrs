@@ -107,7 +107,7 @@ cargo run --release -- check --mirror mirror-shell
 # Recheck specific projects without fetching the root index.
 ./target/release/snatchrs check --mirror mirror-shell --package requests --package packaging
 
-# Emit the complete structured report as well as saving it in the mirror.
+# Emit the summary and detail-file paths as well as saving them in the mirror.
 ./target/release/snatchrs check --mirror mirror-shell --package packaging --json > report.json
 ```
 
@@ -129,7 +129,7 @@ mirror-shell/
   metadata/<normalized-name>.json       # enriched package/release/file metadata
   packages/<normalized-name>/           # empty initially
     <distribution-filename>             # expected future artifact location
-  check-report.json                    # latest run, selected names, checks, errors
+  check-report.json                    # latest run summary and detail-file paths
 ```
 
 Paths stored in the metadata and report are absolute paths under the mirror root.
@@ -229,9 +229,27 @@ For noninteractive runs, concise progress is logged to stderr every five seconds
 
 Saved files include:
 
-- `check-report.json`: selected names, seed, metadata, and each file's state when checked; written when discovery ends.
+- `check-report.json`: selected names, seed, inspection counters, `error_count`, and paths to detail files; written when discovery ends.
 - `mirror-progress.json`: periodically updated checking, worker, and transfer progress.
-- `mirror-report.json`: inspection, download outcomes/errors, and final size checks.
+- `mirror-report.json`: inspection summary, download counters, `downloads.outcomes_path`, and final size checks.
+- `reports/run-*/checked-packages.jsonl`: one checked package per line, including metadata and initial file states (`inspection.packages_path`).
+- `reports/run-*/package-errors.jsonl`: one metadata/queue error per line (`inspection.errors_path`).
+- `reports/run-*/download-outcomes.jsonl`: one completed download outcome per line, including failures.
+
+Both `check` and `mirror` append details as work completes, rather than retaining
+all package metadata or completed download outcomes in memory. Final size checks
+read one checked package at a time. `--json` prints the compact summary, using the
+same format as the saved report. The previous inline `packages`, `errors`, and
+`downloads.outcomes` arrays have been replaced by the JSONL paths above; consumers
+should stream those files line by line. Selected names and queue deduplication
+fingerprints are still retained in memory, and a single project's metadata must
+fit in memory.
+
+Each run has its own detail directory. Earlier report paths remain readable after
+subsequent runs; completed and interrupted run directories are kept for inspection
+and can be removed when their reports are no longer needed. JSONL files may end
+with an incomplete line if the process is interrupted; only complete lines should
+be consumed from an interrupted run.
 
 Any metadata errors, failed downloads, missing/wrong-sized files, or blocked paths
 produce a nonzero exit code after the final report is saved. Reports use atomic

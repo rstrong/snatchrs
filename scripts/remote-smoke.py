@@ -6,6 +6,7 @@ import http.server
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 
@@ -68,6 +69,15 @@ def main():
             repeat = run("mirror", "--concurrency", "2")
             assert repeat["downloads"]["progress"]["downloaded"] == 0
             assert repeat["final_check"]["matching_size"] == 2
+            verification = subprocess.run([
+                sys.executable, str(Path(__file__).with_name("verify-mirror.py")), str(root)
+            ], capture_output=True, text=True, timeout=30)
+            if verification.returncode:
+                raise RuntimeError(verification.stdout + verification.stderr)
+            verified = json.loads(verification.stdout)
+            assert verified["metadata_packages"] == 1
+            assert verified["checked_files"] == 2
+            assert verified["sha256_verified_files"] == 2
             # Prove the deployed CLI accepts large sample counts without making
             # any PyPI requests: this local index contains one fixture project.
             result = subprocess.run([

@@ -409,6 +409,25 @@ fn mirror_respects_samples_above_one_hundred_and_smaller_indexes() {
         assert_eq!(report["final_check"]["matching_size"], expected);
         assert_eq!(report["downloads"]["progress"]["downloaded"], downloaded);
         assert_eq!(report["downloads"]["progress"]["failed"], 0);
+        assert!(report["inspection"].get("packages").is_none());
+        assert!(report["downloads"].get("outcomes").is_none());
+        let checked =
+            fs::read_to_string(report["inspection"]["packages_path"].as_str().unwrap()).unwrap();
+        assert_eq!(checked.lines().count(), expected);
+        for line in checked.lines() {
+            let package: snatchrs::mirror::CheckedPackage = serde_json::from_str(line).unwrap();
+            assert_eq!(package.files.len(), 1);
+        }
+        let outcomes =
+            fs::read_to_string(report["downloads"]["outcomes_path"].as_str().unwrap()).unwrap();
+        assert_eq!(outcomes.lines().count(), downloaded as usize);
+        for line in outcomes.lines() {
+            let outcome: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(outcome["downloaded"], true);
+            assert_eq!(outcome["sha256_verified"], true);
+        }
+        // Detailed file metadata stays out of the summary and JSON stdout.
+        assert!(output.stdout.len() < 16_384);
     }
     assert_eq!(
         fs::read_dir(directory.path().join("packages"))
@@ -646,4 +665,58 @@ fn queued_artifact_size_does_not_stop_checking_and_active_space_failures_are_rep
             .contains("Not enough disk space")
     );
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn streamed_outcomes_are_not_retained_and_sink_errors_drain_workers() {
+    for fail_sink in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..32 {
+                let (mut stream, _) = listener.accept().unwrap();
+                request(&mut stream);
+                respond(&mut stream, "200 OK", b"x", "");
+            }
+        });
+        let directory = tempdir().unwrap();
+        let mut recorded = 0;
+        let result = snatchrs::download::download_stream_to(
+            directory.path(),
+            options(4, 1),
+            |queue| {
+                for i in 0..32 {
+                    queue.enqueue(task(directory.path(), &base, &format!("{i}.whl"), b"x"))?;
+                }
+                Ok(32)
+            },
+            |_| {},
+            |outcome| {
+                recorded += 1;
+                assert!(outcome.downloaded);
+                assert!(outcome.sha256_verified);
+                if fail_sink {
+                    anyhow::bail!("simulated report disk failure");
+                }
+                Ok(())
+            },
+        );
+        server.join().unwrap();
+        for i in 0..32 {
+            assert_eq!(
+                fs::read(directory.path().join(format!("{i}.whl"))).unwrap(),
+                b"x"
+            );
+        }
+        if fail_sink {
+            assert_eq!(recorded, 1);
+            assert!(format!("{:#}", result.unwrap_err()).contains("simulated report disk failure"));
+        } else {
+            let (produced, report) = result.unwrap();
+            assert_eq!(produced, 32);
+            assert_eq!(recorded, 32);
+            assert_eq!(report.progress.downloaded, 32);
+            assert!(report.outcomes.is_empty());
+        }
+    }
 }

@@ -1,10 +1,11 @@
 use std::{
-    io::{self, Write},
+    fs::{self, File},
+    io::{self, BufRead, BufReader, BufWriter, Write},
     path::PathBuf,
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::Args;
 use serde::Serialize;
 use snatchrs::{
@@ -35,7 +36,7 @@ pub struct CheckArgs {
     /// Override the per-project Simple Index base (defaults to --index-url).
     #[arg(long)]
     metadata_url: Option<Url>,
-    /// Print the complete inspection report as JSON.
+    /// Print the summary report as JSON (details are stored in JSONL files).
     #[arg(long)]
     json: bool,
 }
@@ -53,8 +54,45 @@ struct CheckReport {
     selected_packages: Vec<String>,
     summary: CheckSummary,
     queue_stub: DownloadQueueStub,
-    packages: Vec<CheckedPackage>,
-    errors: Vec<PackageError>,
+    packages_path: PathBuf,
+    errors_path: PathBuf,
+    error_count: usize,
+}
+
+// Each run owns its detail files so atomic summary replacement never points an
+// older report at truncated or partially overwritten details from a newer run.
+struct InspectionJournal {
+    packages: BufWriter<File>,
+    errors: BufWriter<File>,
+}
+
+fn append_jsonl(file: &mut BufWriter<File>, value: &impl Serialize) -> Result<()> {
+    serde_json::to_writer(&mut *file, value)?;
+    writeln!(file)?;
+    file.flush()?;
+    Ok(())
+}
+
+fn record_error(
+    report: &mut CheckReport,
+    journal: &mut InspectionJournal,
+    error: PackageError,
+) -> Result<()> {
+    append_jsonl(&mut journal.errors, &error)?;
+    report.error_count += 1;
+    Ok(())
+}
+
+fn visit_packages(
+    path: &std::path::Path,
+    mut visit: impl FnMut(CheckedPackage) -> Result<()>,
+) -> Result<()> {
+    for line in BufReader::new(File::open(path)?).lines() {
+        let package =
+            serde_json::from_str(&line?).context("Invalid checked-package journal record")?;
+        visit(package)?;
+    }
+    Ok(())
 }
 
 #[derive(Args)]
@@ -133,6 +171,18 @@ fn run_inner(
             })
             .collect::<Result<Vec<_>>>()?
     };
+    let reports = layout.root.join("reports");
+    fs::create_dir_all(&reports)?;
+    let run_dir = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(reports)?
+        .keep();
+    let packages_path = run_dir.join("checked-packages.jsonl");
+    let errors_path = run_dir.join("package-errors.jsonl");
+    let mut journal = InspectionJournal {
+        packages: BufWriter::new(File::create(&packages_path)?),
+        errors: BufWriter::new(File::create(&errors_path)?),
+    };
     let mut report = CheckReport {
         mirror_root: layout.root.clone(),
         seed,
@@ -142,8 +192,9 @@ fn run_inner(
             .collect(),
         summary: CheckSummary::default(),
         queue_stub: DownloadQueueStub::default(),
-        packages: Vec::new(),
-        errors: Vec::new(),
+        packages_path,
+        errors_path,
+        error_count: 0,
     };
     if let Some(options) = download {
         if let Some(dashboard) = &dashboard {
@@ -153,7 +204,7 @@ fn run_inner(
             &layout,
             &client,
             packages,
-            report,
+            (report, journal),
             metadata_url,
             options,
             OutputOptions {
@@ -176,24 +227,29 @@ fn run_inner(
                 Ok(metadata)
             });
         match result {
-            Ok(metadata) => report.packages.push(check_package(
-                metadata,
-                &mut report.summary,
-                &mut report.queue_stub,
-            )),
-            Err(error) => report.errors.push(PackageError {
-                name: name.clone(),
-                error: format!("{error:#}"),
-            }),
+            Ok(metadata) => {
+                let checked = check_package(metadata, &mut report.summary, &mut report.queue_stub);
+                append_jsonl(&mut journal.packages, &checked)?;
+            }
+            Err(error) => record_error(
+                &mut report,
+                &mut journal,
+                PackageError {
+                    name: name.clone(),
+                    error: format!("{error:#}"),
+                },
+            )?,
         }
         if let Some(dashboard) = &dashboard {
             dashboard.checking(position + 1, total, &name, &report.summary);
         }
     }
+    journal.packages.get_ref().sync_all()?;
+    journal.errors.get_ref().sync_all()?;
     let report_path = layout.root.join("check-report.json");
     write_json(&report_path, &report)?;
     if let Some(dashboard) = &dashboard {
-        dashboard.finish_check(&report.summary, report.errors.len(), start.elapsed());
+        dashboard.finish_check(&report.summary, report.error_count, start.elapsed());
     }
     if !quiet {
         eprintln!("Report: {}", report_path.display());
@@ -203,7 +259,7 @@ fn run_inner(
         serde_json::to_writer_pretty(&mut stdout, &report)?;
         writeln!(stdout)?;
     } else if !interactive {
-        for package in &report.packages {
+        visit_packages(&report.packages_path, |package| {
             let missing = package
                 .files
                 .iter()
@@ -225,7 +281,8 @@ fn run_inner(
                 missing,
                 mismatch
             )?;
-        }
+            Ok(())
+        })?;
         writeln!(
             stdout,
             "Checked {} packages, {} releases, {} files · {} missing, {} size mismatches, {} matching sizes, {} blocked · {} package errors",
@@ -236,7 +293,7 @@ fn run_inner(
             report.summary.size_mismatch,
             report.summary.matching_size,
             report.summary.blocked,
-            report.errors.len()
+            report.error_count
         )?;
         writeln!(
             stdout,
@@ -246,9 +303,9 @@ fn run_inner(
     }
     stdout.flush()?;
     ensure!(
-        report.errors.is_empty() && report.summary.blocked == 0,
+        report.error_count == 0 && report.summary.blocked == 0,
         "Inspection had {} package errors and {} blocked files; see {}",
-        report.errors.len(),
+        report.error_count,
         report.summary.blocked,
         report_path.display()
     );
@@ -258,8 +315,15 @@ fn run_inner(
 #[derive(Serialize)]
 struct MirrorReport<'a> {
     inspection: &'a CheckReport,
-    downloads: &'a snatchrs::download::DownloadReport,
+    downloads: MirrorDownloads<'a>,
     final_check: snatchrs::mirror::CheckSummary,
+}
+
+#[derive(Serialize)]
+struct MirrorDownloads<'a> {
+    concurrency: usize,
+    progress: &'a snatchrs::download::DownloadProgress,
+    outcomes_path: PathBuf,
 }
 
 struct OutputOptions {
@@ -272,7 +336,7 @@ fn run_pipeline(
     layout: &MirrorLayout,
     client: &IndexClient,
     packages: Vec<Package>,
-    inspection: CheckReport,
+    inspection: (CheckReport, InspectionJournal),
     metadata_url: Url,
     options: snatchrs::download::DownloadOptions,
     output: OutputOptions,
@@ -282,6 +346,13 @@ fn run_pipeline(
         no_progress,
         json,
     } = output;
+    let outcomes_path = inspection
+        .0
+        .packages_path
+        .parent()
+        .context("Missing run directory")?
+        .join("download-outcomes.jsonl");
+    let mut outcomes_file = BufWriter::new(File::create(&outcomes_path)?);
     let mut ui = crate::interactive(quiet, no_progress, json)
         .then(|| crate::download_ui::DownloadDashboard::new(options.concurrency));
     let mut checkpoint = Instant::now()
@@ -289,7 +360,7 @@ fn run_pipeline(
         .unwrap_or_else(Instant::now);
     let mut log_time = Instant::now();
     let mut checkpoint_error = None;
-    let (inspection, downloads) = snatchrs::download::download_stream(
+    let (inspection, downloads) = snatchrs::download::download_stream_to(
         &layout.root,
         options,
         |queue| inspect_stream(queue, layout, client, metadata_url, packages, inspection),
@@ -320,14 +391,29 @@ fn run_pipeline(
                 log_time = Instant::now();
             }
         },
+        |outcome| append_jsonl(&mut outcomes_file, outcome),
     )?;
+    outcomes_file.get_ref().sync_all()?;
     if let Some(ui) = &ui {
         ui.finish(&downloads.progress);
     }
+    let mut final_check = CheckSummary::default();
+    visit_packages(&inspection.packages_path, |package| {
+        check_package(
+            package.metadata,
+            &mut final_check,
+            &mut DownloadQueueStub::default(),
+        );
+        Ok(())
+    })?;
     let report = MirrorReport {
-        final_check: snatchrs::download::final_summary(&inspection.packages),
+        final_check,
         inspection: &inspection,
-        downloads: &downloads,
+        downloads: MirrorDownloads {
+            concurrency: downloads.concurrency,
+            progress: &downloads.progress,
+            outcomes_path,
+        },
     };
     let path = layout.root.join("mirror-report.json");
     write_json(&path, &report)?;
@@ -345,18 +431,18 @@ fn run_pipeline(
             downloads.progress.downloaded,
             downloads.progress.failed,
             report.final_check.matching_size,
-            inspection.errors.len()
+            inspection.error_count
         )?;
     }
     stdout.flush()?;
     ensure!(
-        inspection.errors.is_empty()
+        inspection.error_count == 0
             && downloads.progress.failed == 0
             && report.final_check.blocked == 0
             && report.final_check.missing == 0
             && report.final_check.size_mismatch == 0,
         "Mirror incomplete: {} inspection errors, {} failed downloads, {} missing, {} wrong-sized, {} blocked; see {}",
-        inspection.errors.len(),
+        inspection.error_count,
         downloads.progress.failed,
         report.final_check.missing,
         report.final_check.size_mismatch,
@@ -385,7 +471,7 @@ fn discovery(
         files: report.summary.files,
         missing: report.summary.missing,
         size_mismatch: report.summary.size_mismatch,
-        errors: report.errors.len(),
+        errors: report.error_count,
         finished: false,
     }
 }
@@ -396,8 +482,9 @@ fn inspect_stream(
     client: &IndexClient,
     metadata_url: Url,
     packages: Vec<Package>,
-    mut report: CheckReport,
+    inspection: (CheckReport, InspectionJournal),
 ) -> Result<CheckReport> {
+    let (mut report, mut journal) = inspection;
     let total = packages.len();
     queue.discovery(discovery(&report, total, 0, ""))?;
     for (position, package) in packages.into_iter().enumerate() {
@@ -414,7 +501,7 @@ fn inspect_stream(
             Ok(metadata) => {
                 let checked = check_package(metadata, &mut report.summary, &mut report.queue_stub);
                 let tasks = snatchrs::download::build_tasks(std::slice::from_ref(&checked));
-                report.packages.push(checked);
+                append_jsonl(&mut journal.packages, &checked)?;
                 let queued = tasks.and_then(|tasks| {
                     for task in tasks {
                         queue.enqueue(task)?;
@@ -422,23 +509,33 @@ fn inspect_stream(
                     Ok(())
                 });
                 if let Err(error) = queued {
-                    report.errors.push(PackageError {
-                        name: name.clone(),
-                        error: format!("Failed to queue downloads: {error:#}"),
-                    });
+                    record_error(
+                        &mut report,
+                        &mut journal,
+                        PackageError {
+                            name: name.clone(),
+                            error: format!("Failed to queue downloads: {error:#}"),
+                        },
+                    )?;
                     stop = true;
                 }
             }
-            Err(error) => report.errors.push(PackageError {
-                name: name.clone(),
-                error: format!("{error:#}"),
-            }),
+            Err(error) => record_error(
+                &mut report,
+                &mut journal,
+                PackageError {
+                    name: name.clone(),
+                    error: format!("{error:#}"),
+                },
+            )?,
         }
         queue.discovery(discovery(&report, total, position + 1, &name))?;
         if stop {
             break;
         }
     }
+    journal.packages.get_ref().sync_all()?;
+    journal.errors.get_ref().sync_all()?;
     write_json(&layout.root.join("check-report.json"), &report)?;
     Ok(report)
 }

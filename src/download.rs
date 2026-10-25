@@ -334,7 +334,7 @@ fn validate_path(root: &Path, task: &DownloadTask) -> Result<()> {
     Ok(())
 }
 
-/// Retained batch API; the CLI uses download_stream to overlap checking and I/O.
+/// Retained batch API; the CLI streams outcomes with download_stream_to.
 pub fn download_all(
     root: &Path,
     tasks: &[DownloadTask],
@@ -360,6 +360,7 @@ pub fn download_all(
             Ok(())
         },
         progress,
+        None,
     )?;
     Ok(report)
 }
@@ -372,8 +373,30 @@ pub fn download_stream<T: Send>(
     producer: impl FnOnce(&mut DownloadQueue) -> Result<T> + Send,
     progress: impl FnMut(&DownloadProgress),
 ) -> Result<(T, DownloadReport)> {
-    stream_with_workers(root, options, options.concurrency, producer, progress)
+    stream_with_workers(root, options, options.concurrency, producer, progress, None)
 }
+
+/// Stream completed outcomes to a fallible sink instead of retaining them in RAM.
+/// The returned report has an empty `outcomes` vector; counters remain complete.
+/// A sink failure drains workers before returning the error.
+pub fn download_stream_to<T: Send>(
+    root: &Path,
+    options: DownloadOptions,
+    producer: impl FnOnce(&mut DownloadQueue) -> Result<T> + Send,
+    progress: impl FnMut(&DownloadProgress),
+    mut outcome: impl FnMut(&DownloadOutcome) -> Result<()>,
+) -> Result<(T, DownloadReport)> {
+    stream_with_workers(
+        root,
+        options,
+        options.concurrency,
+        producer,
+        progress,
+        Some(&mut outcome),
+    )
+}
+
+type OutcomeSink<'a> = dyn FnMut(&DownloadOutcome) -> Result<()> + 'a;
 
 fn stream_with_workers<T: Send>(
     root: &Path,
@@ -381,6 +404,7 @@ fn stream_with_workers<T: Send>(
     worker_count: usize,
     producer: impl FnOnce(&mut DownloadQueue) -> Result<T> + Send,
     mut progress: impl FnMut(&DownloadProgress),
+    mut outcome_sink: Option<&mut OutcomeSink<'_>>,
 ) -> Result<(T, DownloadReport)> {
     ensure!(
         (1..=64).contains(&options.concurrency),
@@ -435,6 +459,7 @@ fn stream_with_workers<T: Send>(
     let start = Instant::now();
     let mut last_update = Instant::now();
     let mut outcomes = Vec::new();
+    let mut sink_error = None;
     let produced = thread::scope(|scope| -> Result<T> {
         let mut handles = Vec::new();
         for worker in 0..worker_count {
@@ -568,7 +593,15 @@ fn stream_with_workers<T: Send>(
                             state.failed += 1;
                             state.workers[worker].state = "failed".into();
                         }
-                        outcomes.push(*outcome);
+                        if let Some(sink) = outcome_sink.as_mut() {
+                            if sink_error.is_none()
+                                && let Err(error) = sink(&outcome)
+                            {
+                                sink_error = Some(error);
+                            }
+                        } else {
+                            outcomes.push(*outcome);
+                        }
                     }
                 }
             }
@@ -592,6 +625,9 @@ fn stream_with_workers<T: Send>(
     })?;
     state.elapsed_seconds = start.elapsed().as_secs_f64();
     progress(&state);
+    if let Some(error) = sink_error {
+        return Err(error.context("Cannot record download outcome"));
+    }
     outcomes.sort_by(|a, b| a.task.local_path.cmp(&b.task.local_path));
     Ok((
         produced,

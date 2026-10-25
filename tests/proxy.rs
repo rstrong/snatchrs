@@ -304,12 +304,7 @@ fn https_proxy_is_used_by_download_workers() {
         .unwrap();
         assert!(!output.status.success());
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert!(
-            report["inspection"]["errors"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(report["inspection"]["error_count"], 0);
         assert_eq!(report["downloads"]["progress"]["failed"], 1);
         let requests = proxy.requests();
         assert_eq!(requests.len(), 1);
