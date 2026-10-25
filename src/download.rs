@@ -104,8 +104,38 @@ pub struct WorkerProgress {
     pub bytes: u64,
     pub size: u64,
     pub attempt: u32,
-    pub state: String,
+    pub state: WorkerState,
     pub retry_delay_seconds: Option<f64>,
+}
+
+/// Serialized in snake_case, matching the strings progress files always used.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    #[default]
+    Waiting,
+    Downloading,
+    Retrying,
+    Done,
+    Failed,
+}
+
+impl WorkerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Downloading => "downloading",
+            Self::Retrying => "retrying",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -464,10 +494,7 @@ fn stream_with_workers<T: Send>(
         transferred_bytes: 0,
         elapsed_seconds: 0.0,
         workers: (0..worker_count)
-            .map(|_| WorkerProgress {
-                state: "waiting".into(),
-                ..Default::default()
-            })
+            .map(|_| WorkerProgress::default())
             .collect(),
     };
     progress(&state);
@@ -596,7 +623,7 @@ fn stream_with_workers<T: Send>(
                             bytes: 0,
                             size,
                             attempt,
-                            state: "downloading".into(),
+                            state: WorkerState::Downloading,
                             retry_delay_seconds: None,
                         };
                     }
@@ -605,7 +632,7 @@ fn stream_with_workers<T: Send>(
                         state.transferred_bytes += bytes;
                     }
                     Event::Retrying { worker, delay } => {
-                        state.workers[worker].state = "retrying".into();
+                        state.workers[worker].state = WorkerState::Retrying;
                         state.workers[worker].retry_delay_seconds = Some(delay.as_secs_f64());
                         state.workers[worker].bytes = 0;
                     }
@@ -613,10 +640,10 @@ fn stream_with_workers<T: Send>(
                         if outcome.downloaded {
                             state.downloaded += 1;
                             state.verified_bytes += outcome.task.size;
-                            state.workers[worker].state = "done".into();
+                            state.workers[worker].state = WorkerState::Done;
                         } else {
                             state.failed += 1;
-                            state.workers[worker].state = "failed".into();
+                            state.workers[worker].state = WorkerState::Failed;
                         }
                         if let Some(sink) = outcome_sink.as_mut() {
                             if sink_error.is_none()

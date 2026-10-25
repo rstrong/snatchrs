@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 use snatchrs::{
     IndexClient, Package,
-    download::{DownloadOptions, DownloadTask, download_all},
+    download::{DownloadOptions, DownloadTask, WorkerState, download_all},
     mirror::MirrorLayout,
 };
 use std::{
@@ -277,10 +277,9 @@ fn download_retry_after_http_date_is_respected_and_visible_in_progress() {
         &[task(&server, root.path(), b"x")],
         options(3),
         |progress| {
-            saw_retry |= progress
-                .workers
-                .iter()
-                .any(|worker| worker.state == "retrying" && worker.retry_delay_seconds.is_some());
+            saw_retry |= progress.workers.iter().any(|worker| {
+                worker.state == WorkerState::Retrying && worker.retry_delay_seconds.is_some()
+            });
         },
     )
     .unwrap();
@@ -440,5 +439,19 @@ fn project_404_is_not_retried_and_later_projects_are_still_checked() {
             );
             assert_eq!(report["final_check"]["packages"], 1);
         }
+    }
+}
+
+#[test]
+fn worker_states_serialize_as_progress_file_strings() {
+    for (state, text) in [
+        (WorkerState::Waiting, "waiting"),
+        (WorkerState::Downloading, "downloading"),
+        (WorkerState::Retrying, "retrying"),
+        (WorkerState::Done, "done"),
+        (WorkerState::Failed, "failed"),
+    ] {
+        assert_eq!(serde_json::to_value(state).unwrap(), text);
+        assert_eq!(state.to_string(), text);
     }
 }

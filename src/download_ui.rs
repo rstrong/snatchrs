@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use snatchrs::download::DownloadProgress;
+use snatchrs::download::{DownloadProgress, WorkerState};
 
 pub struct DownloadDashboard {
     _multi: MultiProgress,
@@ -68,12 +68,12 @@ impl DownloadDashboard {
         let active = progress
             .workers
             .iter()
-            .filter(|worker| worker.state == "downloading")
+            .filter(|worker| worker.state == WorkerState::Downloading)
             .count();
         let retrying = progress
             .workers
             .iter()
-            .filter(|worker| worker.state == "retrying")
+            .filter(|worker| worker.state == WorkerState::Retrying)
             .count();
         let queued = progress
             .total_files
@@ -91,7 +91,7 @@ impl DownloadDashboard {
         let inflight: u64 = progress
             .workers
             .iter()
-            .filter(|worker| worker.state == "downloading")
+            .filter(|worker| worker.state == WorkerState::Downloading)
             .map(|worker| worker.bytes.min(worker.size))
             .sum();
         self.bytes.set_position(progress.verified_bytes + inflight);
