@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::mirror::{CheckedPackage, FileState};
+use crate::mirror::CheckedPackage;
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -728,29 +728,4 @@ fn download_one(
         progress(unreported);
     }
     result
-}
-
-/// Refresh the final file checks after publication, preserving the selection.
-pub fn final_summary(root: &Path, packages: &[CheckedPackage]) -> crate::mirror::CheckSummary {
-    let mut summary = crate::mirror::CheckSummary::default();
-    for package in packages {
-        summary.packages += 1;
-        summary.releases += package.metadata.releases.len();
-        for file in package
-            .metadata
-            .releases
-            .iter()
-            .flat_map(|release| &release.files)
-        {
-            summary.files += 1;
-            summary.expected_bytes += file.size;
-            match crate::mirror::inspect_file(root, file) {
-                FileState::Missing => summary.missing += 1,
-                FileState::SizeMismatch { .. } => summary.size_mismatch += 1,
-                FileState::MatchingSize => summary.matching_size += 1,
-                FileState::NotRegularFile | FileState::Error { .. } => summary.blocked += 1,
-            }
-        }
-    }
-    summary
 }
