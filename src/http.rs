@@ -16,10 +16,14 @@ use reqwest::{
 pub(crate) const DEFAULT_ATTEMPTS: u32 = 3;
 
 pub(crate) fn client_builder() -> ClientBuilder {
+    transport_builder().into()
+}
+
+pub(crate) fn transport_builder() -> reqwest::ClientBuilder {
     // Keep reqwest's automatic environment-proxy discovery enabled. Installing
     // an explicit Proxy or calling no_proxy() here would override its handling
     // of HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY and lowercase equivalents.
-    Client::builder()
+    reqwest::Client::builder()
         // Keep a single attempt budget rather than stacking reqwest retries
         // underneath our status/body-aware application policy.
         .retry(reqwest::retry::never())

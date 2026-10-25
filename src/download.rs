@@ -67,14 +67,15 @@ fn same_file(a: &DownloadTask, b: &DownloadTask) -> bool {
 pub struct DownloadOptions {
     pub concurrency: usize,
     pub attempts: u32,
-    pub timeout: Duration,
+    /// Maximum time without response data; active transfers have no total deadline.
+    pub read_timeout: Duration,
 }
 impl Default for DownloadOptions {
     fn default() -> Self {
         Self {
             concurrency: 8,
             attempts: 3,
-            timeout: Duration::from_secs(900),
+            read_timeout: Duration::from_secs(900),
         }
     }
 }
@@ -390,9 +391,19 @@ fn stream_with_workers<T: Send>(
         "Download attempts must be between 1 and 10"
     );
     let root = root.canonicalize()?;
-    let client = crate::http::client_builder()
-        .gzip(false)
-        .timeout(options.timeout)
+    // Configure per-read stalls on the async transport, then disable the
+    // blocking wrapper's separate timeout so active large files can finish.
+    let client = reqwest::blocking::ClientBuilder::from(
+        crate::http::transport_builder()
+            .gzip(false)
+            .read_timeout(options.read_timeout),
+    )
+    .timeout(None)
+    .build()?;
+    // The blocking response polls the async read-timeout timer on each worker.
+    let read_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_time()
         .build()?;
     let mut state = DownloadProgress {
         discovery: DiscoveryProgress::default(),
@@ -432,7 +443,9 @@ fn stream_with_workers<T: Send>(
             let client = &client;
             let root = &root;
             let budget = &budget;
+            let read_runtime = &read_runtime;
             handles.push(scope.spawn(move || -> Result<()> {
+                let _runtime = read_runtime.enter();
                 loop {
                     let Some(task) = jobs.next()? else {
                         break;

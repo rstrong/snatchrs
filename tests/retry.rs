@@ -29,6 +29,7 @@ struct Reply {
     declared_length: Option<usize>,
     disconnect: bool,
     body_delay: Duration,
+    chunk_delay: Duration,
 }
 impl Reply {
     fn new(status: u16, body: &[u8]) -> Self {
@@ -39,6 +40,7 @@ impl Reply {
             declared_length: None,
             disconnect: false,
             body_delay: Duration::ZERO,
+            chunk_delay: Duration::ZERO,
         }
     }
 }
@@ -89,7 +91,10 @@ impl Server {
                             let header = format!("HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n", reply.status, reply.declared_length.unwrap_or(reply.body.len()));
                             if stream.write_all(header.as_bytes()).is_err() { return; }
                             thread::sleep(reply.body_delay);
-                            let _ = stream.write_all(&reply.body);
+                            for chunk in reply.body.chunks(1024) {
+                                if stream.write_all(chunk).is_err() { return; }
+                                thread::sleep(reply.chunk_delay);
+                            }
                         });
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -151,7 +156,7 @@ fn options(attempts: u32) -> DownloadOptions {
     DownloadOptions {
         concurrency: 1,
         attempts,
-        timeout: Duration::from_secs(3),
+        read_timeout: Duration::from_secs(3),
     }
 }
 
@@ -343,7 +348,7 @@ fn downloads_retry_truncated_bodies_and_read_timeouts() {
             root.path(),
             &[task(&server, root.path(), b"hello")],
             DownloadOptions {
-                timeout,
+                read_timeout: timeout,
                 ..options(2)
             },
             |_| {},
@@ -354,4 +359,31 @@ fn downloads_retry_truncated_bodies_and_read_timeouts() {
         assert_eq!(server.count(), 2);
         assert!(report.outcomes[0].sha256_verified);
     }
+}
+
+#[test]
+fn active_download_can_outlast_read_timeout() {
+    let body = vec![42; 16 * 1024];
+    let mut reply = Reply::new(200, &body);
+    reply.chunk_delay = Duration::from_millis(100);
+    let server = Server::start(vec![reply]);
+    let root = tempdir().unwrap();
+    let read_timeout = Duration::from_millis(500);
+    let started = Instant::now();
+    let report = download_all(
+        root.path(),
+        &[task(&server, root.path(), &body)],
+        DownloadOptions {
+            read_timeout,
+            ..options(1)
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert!(started.elapsed() > read_timeout * 2);
+    assert_eq!(report.progress.downloaded, 1, "{:?}", report.outcomes);
+    assert_eq!(report.outcomes[0].attempts, 1);
+    assert!(report.outcomes[0].sha256_verified);
+    assert_eq!(fs::read(root.path().join("artifact.whl")).unwrap(), body);
+    assert_eq!(server.count(), 1);
 }

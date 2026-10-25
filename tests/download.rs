@@ -60,7 +60,7 @@ fn options(concurrency: usize, attempts: u32) -> DownloadOptions {
     DownloadOptions {
         concurrency,
         attempts,
-        timeout: Duration::from_secs(5),
+        read_timeout: Duration::from_secs(5),
     }
 }
 
