@@ -385,10 +385,8 @@ fn stream_with_workers<T: Send>(
         "Download attempts must be between 1 and 10"
     );
     let root = root.canonicalize()?;
-    let client = Client::builder()
+    let client = crate::http::client_builder()
         .gzip(false)
-        .user_agent(concat!("snatchrs/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(15))
         .timeout(options.timeout)
         .build()?;
     let mut state = DownloadProgress {

@@ -235,6 +235,42 @@ The runner uses `snatchrs` from `PATH` unless `SNATCHRS_BIN` is provided. It rec
 The verification script writes `verification.json`. It reports metadata errors
 separately and returns nonzero for artifact integrity errors or download failures.
 
+## HTTP and HTTPS proxies
+
+Set proxy environment variables before starting the program. They apply to index
+requests, package metadata, and every artifact download:
+
+| Variable | Lowercase equivalent | Purpose |
+| --- | --- | --- |
+| `HTTP_PROXY` | `http_proxy` | Proxy for HTTP destinations |
+| `HTTPS_PROXY` | `https_proxy` | Proxy for HTTPS destinations, using CONNECT |
+| `ALL_PROXY` | `all_proxy` | Fallback when no protocol-specific proxy is set |
+| `NO_PROXY` | `no_proxy` | Comma-separated hosts or addresses to reach directly |
+
+```bash
+export HTTP_PROXY=http://proxy.example.org:3128
+export HTTPS_PROXY=http://proxy.example.org:3128
+export NO_PROXY=localhost,127.0.0.1
+
+./target/release/snatchrs mirror --mirror ./mirror-shell --sample 100 --concurrency 8
+```
+
+Replace the example proxy hostname with your proxy. An `http://` proxy URL in
+`HTTPS_PROXY` is normal: CONNECT tunnels the HTTPS connection through the proxy,
+and destination TLS certificates are still verified. Proxy URLs can include
+authentication credentials. Protocol-specific variables take priority over
+`ALL_PROXY`; `NO_PROXY` bypasses the proxy for matching destinations. Proxy
+failures are reported as request or download errors.
+
+The clients share the same transport defaults and follow
+[reqwest's environment proxy behavior](https://docs.rs/reqwest/0.12.28/reqwest/#proxies).
+Proxy regressions run entirely against local test servers, in child processes
+with isolated environment variables:
+
+```bash
+cargo test --test proxy
+```
+
 ## Development
 
 ```bash

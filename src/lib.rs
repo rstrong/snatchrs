@@ -1,6 +1,7 @@
 //! Discover PyPI projects, load release metadata, and check local mirror files.
 
 pub mod download;
+mod http;
 pub mod mirror;
 
 use std::{
@@ -127,9 +128,7 @@ pub struct IndexClient {
 impl IndexClient {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
-                .user_agent(concat!("snatchrs/", env!("CARGO_PKG_VERSION")))
-                .connect_timeout(Duration::from_secs(15))
+            client: http::client_builder()
                 .timeout(Duration::from_secs(180))
                 .gzip(true)
                 .build()?,
