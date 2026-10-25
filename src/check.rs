@@ -10,8 +10,8 @@ use serde::Serialize;
 use snatchrs::{
     DEFAULT_INDEX_URL, IndexClient, IndexProgress, Package,
     mirror::{
-        CheckSummary, CheckedPackage, DEFAULT_METADATA_URL, DownloadQueueStub, MirrorLayout,
-        check_package, sample_packages, write_json,
+        CheckSummary, CheckedPackage, DownloadQueueStub, MirrorLayout, check_package,
+        sample_packages, write_json,
     },
 };
 use url::Url;
@@ -32,9 +32,9 @@ pub struct CheckArgs {
     packages: Vec<String>,
     #[arg(long, default_value = DEFAULT_INDEX_URL)]
     index_url: Url,
-    /// Base URL for the PyPI-specific project JSON API.
-    #[arg(long, default_value = DEFAULT_METADATA_URL)]
-    metadata_url: Url,
+    /// Override the per-project Simple Index base (defaults to --index-url).
+    #[arg(long)]
+    metadata_url: Option<Url>,
     /// Print the complete inspection report as JSON.
     #[arg(long)]
     json: bool,
@@ -98,6 +98,10 @@ fn run_inner(
     let layout = MirrorLayout::create(&args.mirror)?;
     let _lock = layout.lock()?;
     let client = IndexClient::new()?;
+    let metadata_url = args
+        .metadata_url
+        .clone()
+        .unwrap_or_else(|| args.index_url.clone());
     let seed = args
         .packages
         .is_empty()
@@ -151,7 +155,7 @@ fn run_inner(
             &client,
             packages,
             report,
-            args.metadata_url,
+            metadata_url,
             options,
             OutputOptions {
                 quiet,
@@ -167,7 +171,7 @@ fn run_inner(
             dashboard.checking(position, total, &name, &report.summary);
         }
         let result = client
-            .fetch_metadata(package, args.metadata_url.clone(), &layout)
+            .fetch_metadata(package, metadata_url.clone(), &layout)
             .and_then(|metadata| {
                 layout.save_metadata(&metadata)?;
                 Ok(metadata)

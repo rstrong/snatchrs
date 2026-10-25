@@ -135,17 +135,27 @@ Paths stored in the metadata and report are absolute paths under the mirror root
 `PackageMetadata` contains the package, metadata URL, metadata file path, package
 directory, last serial, and every release version. `Release` contains all its
 distribution files (all wheels and source distributions, including yanked files).
-Empty releases are preserved. Versions are ordered lexically, not by Python
+Empty releases advertised by the index are preserved. Versions are ordered lexically, not by Python
 version precedence. Each `DistributionFile` contains filename, download URL, local
 path, expected byte size, optional SHA256, distribution type, Python requirement,
 and yanked state.
 
-`check` uses the [PyPI project JSON API](https://docs.pypi.org/api/json/) because it
-provides version-grouped files and sizes in a single response. PyPI deprecates its
-`releases` field; this dependency is isolated in `IndexClient::fetch_metadata` so
-the metadata source can change later. A response missing releases or a file size
-fails explicitly. `--metadata-url` configures this API base independently of
-`--index-url`; changing the index alone does not change the metadata server.
+`check` and `mirror` use the per-project
+[Simple JSON API](https://docs.pypi.org/api/index-api/#get-distributions-for-project):
+`<index-url>/<normalized-project>/` with
+`Accept: application/vnd.pypi.simple.v1+json`. Both the project listing and package
+metadata follow `--index-url` by default. `--metadata-url` optionally overrides
+the Simple Index base for project metadata; it takes a Simple API base URL.
+
+The API's flat `files` list supplies URLs, sizes, `hashes`, `requires-python`, and
+boolean or string `yanked` values. Relative file URLs are resolved against the
+final response URL, including redirects. Files are grouped into the advertised
+`versions` using their filenames, with PEP 440 equivalence for normalized version
+spellings and support for legacy egg/installer names. Distribution type is inferred
+from the filename. Ambiguous or unassignable files fail explicitly rather than
+being silently omitted. If an older response omits `versions`, versions are
+inferred from recognizable filenames. Missing file sizes fail explicitly, since
+size checks require them. There is no fallback to the deprecated project JSON API.
 
 File inspection records `missing`, `size_mismatch` (including actual size),
 `matching_size`, `not_regular_file`, or `error`. A matching size is only a size

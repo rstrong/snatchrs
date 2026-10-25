@@ -255,10 +255,10 @@ fn cli_downloads_then_skips_existing_file_on_repeat() {
     let base = format!("http://{}", listener.local_addr().unwrap());
     let body = b"sample artifact bytes";
     let metadata = serde_json::json!({
-        "info": {"name": "test"}, "releases": {"1.0": [{
+        "name": "test", "meta": {"api-version": "1.4"}, "versions": ["1.0"], "files": [{
             "filename": "test-1.0.tar.gz", "url": format!("{base}/artifact"), "size": body.len(),
-            "digests": {"sha256": format!("{:x}", Sha256::digest(body))}, "yanked": true
-        }]}
+            "hashes": {"sha256": format!("{:x}", Sha256::digest(body))}, "yanked": true
+        }]
     })
     .to_string();
     let server = thread::spawn(move || {
@@ -283,7 +283,7 @@ fn cli_downloads_then_skips_existing_file_on_repeat() {
                 "--package",
                 "test",
                 "--metadata-url",
-                &format!("{base}/pypi/"),
+                &format!("{base}/simple/"),
                 "--concurrency",
                 "2",
                 "--json",
@@ -340,14 +340,14 @@ fn mirror_respects_samples_above_one_hundred_and_smaller_indexes() {
                             let path = request.split_whitespace().nth(1).unwrap();
                             if path == "/simple/" {
                                 respond(&mut stream, "200 OK", index.as_bytes(), "");
-                            } else if path.starts_with("/pypi/") {
+                            } else if path.starts_with("/simple/") {
                                 let name = path.split('/').nth(2).unwrap();
                                 let metadata = serde_json::json!({
-                                    "info": {"name": name}, "releases": {"1.0": [{
+                                    "name": name, "meta": {"api-version": "1.4"}, "versions": ["1.0"], "files": [{
                                         "filename": format!("{name}-1.0.tar.gz"),
                                         "url": format!("{base}/files/{name}-1.0.tar.gz"),
-                                        "size": 1, "digests": {"sha256": format!("{:x}", Sha256::digest(b"x"))}
-                                    }]}
+                                        "size": 1, "hashes": {"sha256": format!("{:x}", Sha256::digest(b"x"))}
+                                    }]
                                 }).to_string();
                                 respond(&mut stream, "200 OK", metadata.as_bytes(), "");
                             } else {
@@ -380,8 +380,6 @@ fn mirror_respects_samples_above_one_hundred_and_smaller_indexes() {
                     "--json",
                     "--index-url",
                     &format!("{base}/simple/"),
-                    "--metadata-url",
-                    &format!("{base}/pypi/"),
                     "--mirror",
                 ])
                 .arg(directory.path())
@@ -429,10 +427,10 @@ fn downloads_and_progress_start_before_later_metadata_finishes() {
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let body = b"overlapped artifact";
-    let early = serde_json::json!({"info":{"name":"early"},"releases":{"1.0":[{
+    let early = serde_json::json!({"name":"early","meta":{"api-version":"1.4"},"versions":["1.0"],"files":[{
         "filename":"early-1.0.whl","url":format!("{base}/artifact"),"size":body.len(),
-        "digests":{"sha256":format!("{:x}",Sha256::digest(body))}
-    }]}})
+        "hashes":{"sha256":format!("{:x}",Sha256::digest(body))}
+    }]})
     .to_string();
     let stop = Arc::new(AtomicBool::new(false));
     let overlapped = Arc::new(AtomicBool::new(false));
@@ -449,12 +447,12 @@ fn downloads_and_progress_start_before_later_metadata_finishes() {
                         let overlapped = &server_overlap;
                         scope.spawn(move || {
                             let request = request(&mut stream);
-                            if request.starts_with("GET /pypi/early/json ") {
+                            if request.starts_with("GET /simple/early/ ") {
                                 respond(&mut stream, "200 OK", early.as_bytes(), "");
                             } else if request.starts_with("GET /artifact ") {
                                 respond(&mut stream, "200 OK", body, "");
                             } else {
-                                assert!(request.starts_with("GET /pypi/later/json "));
+                                assert!(request.starts_with("GET /simple/later/ "));
                                 let deadline = Instant::now() + Duration::from_secs(5);
                                 // Keep metadata unavailable until the first artifact is
                                 // fully published AND its live progress has been saved.
@@ -477,7 +475,7 @@ fn downloads_and_progress_start_before_later_metadata_finishes() {
                                 respond(
                                     &mut stream,
                                     "200 OK",
-                                    br#"{"info":{"name":"later"},"releases":{}}"#,
+                                    br#"{"name":"later","meta":{"api-version":"1.4"},"versions":[],"files":[]}"#,
                                     "",
                                 );
                             }
@@ -499,7 +497,7 @@ fn downloads_and_progress_start_before_later_metadata_finishes() {
             "--package",
             "later",
             "--metadata-url",
-            &format!("{base}/pypi/"),
+            &format!("{base}/simple/"),
             "--concurrency",
             "2",
             "--json",

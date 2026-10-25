@@ -1,6 +1,7 @@
 //! Discover PyPI projects, load release metadata, and check local mirror files.
 
 pub mod download;
+mod filename;
 mod http;
 pub mod mirror;
 

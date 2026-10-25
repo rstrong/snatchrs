@@ -1,15 +1,43 @@
 {
-  "info": {"name": "Example_Pkg"},
-  "last_serial": 12345,
-  "releases": {
-    "0.1": [],
-    "1.0": [
-      {"filename": "example_pkg-1.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/ab/example_pkg-1.0-py3-none-any.whl", "size": 4, "digests": {"sha256": "abc123"}, "packagetype": "bdist_wheel", "requires_python": ">=3.9", "yanked": false},
-      {"filename": "example_pkg-1.0.tar.gz", "url": "https://files.pythonhosted.org/packages/cd/example_pkg-1.0.tar.gz", "size": 5, "packagetype": "sdist"}
-    ],
-    "2.0": [
-      {"filename": "example_pkg-2.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/ef/example_pkg-2.0-py3-none-any.whl", "size": 6, "yanked": true},
-      {"filename": "example_pkg-2.0.tar.gz", "url": "https://files.pythonhosted.org/packages/gh/example_pkg-2.0.tar.gz", "size": 0}
-    ]
-  }
+  "name": "Example_Pkg",
+  "meta": {
+    "api-version": "1.4",
+    "_last-serial": 12345
+  },
+  "versions": [
+    "0.1",
+    "1.0",
+    "2.0"
+  ],
+  "files": [
+    {
+      "filename": "example_pkg-1.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/ab/example_pkg-1.0-py3-none-any.whl",
+      "size": 4,
+      "yanked": false,
+      "hashes": {
+        "sha256": "abc123"
+      },
+      "requires-python": ">=3.9"
+    },
+    {
+      "filename": "example_pkg-1.0.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/cd/example_pkg-1.0.tar.gz",
+      "size": 5,
+      "hashes": {}
+    },
+    {
+      "filename": "example_pkg-2.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/ef/example_pkg-2.0-py3-none-any.whl",
+      "size": 6,
+      "yanked": true,
+      "hashes": {}
+    },
+    {
+      "filename": "example_pkg-2.0.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/gh/example_pkg-2.0.tar.gz",
+      "size": 0,
+      "hashes": {}
+    }
+  ]
 }

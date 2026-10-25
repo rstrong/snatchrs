@@ -35,23 +35,23 @@ def main():
             (existing / "existing.whl").write_bytes(b"present")
 
         def metadata(name, filenames, data):
-            return json.dumps({"info": {"name": name}, "releases": {"1.0": [
+            return json.dumps({"name": name, "meta": {"api-version": "1.4"}, "versions": ["1.0"], "files": [
                 {"filename": filename, "size": len(data),
                  "url": f"http://127.0.0.1:{server.server_port}/artifact/{filename}",
-                 "digests": {"sha256": hashlib.sha256(data).hexdigest()}}
+                 "hashes": {"sha256": hashlib.sha256(data).hexdigest()}}
                 for filename in filenames
-            ]}}).encode()
+            ]}).encode()
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path == "/pypi/early/json":
+                if self.path == "/simple/early/":
                     names = [f"early-{index}.whl" for index in range(20)] if args.check_ahead else ["early-1.0.whl"]
                     payload = metadata("early", names, body)
-                elif self.path == "/pypi/existing/json":
+                elif self.path == "/simple/existing/":
                     payload = metadata("existing", ["existing.whl"], b"present")
-                elif self.path == "/pypi/later/json" and args.check_ahead:
+                elif self.path == "/simple/later/" and args.check_ahead:
                     payload = metadata("later", ["later.whl"], body)
-                elif self.path == "/pypi/later/json":
+                elif self.path == "/simple/later/":
                     deadline = time.monotonic() + 10
                     while time.monotonic() < deadline:
                         try:
@@ -65,7 +65,7 @@ def main():
                         except (OSError, KeyError):
                             pass
                         time.sleep(0.02)
-                    payload = b'{"info":{"name":"later"},"releases":{}}'
+                    payload = b'{"name":"later","meta":{"api-version":"1.4"},"versions":[],"files":[]}'
                 elif self.path.startswith("/artifact/"):
                     if args.check_ahead:
                         deadline = time.monotonic() + 10
@@ -103,7 +103,7 @@ def main():
         process = subprocess.Popen([
             str(args.binary.resolve()), "mirror", "--mirror", str(root),
             *selection, "--concurrency", "2",
-            "--metadata-url", f"http://127.0.0.1:{server.server_port}/pypi/"
+            "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/"
         ], stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,
             env={**os.environ, "TERM": "xterm-256color"})
         os.close(slave)

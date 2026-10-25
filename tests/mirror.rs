@@ -7,7 +7,7 @@ use std::{
 };
 
 use snatchrs::{
-    Package, PackageIndex,
+    IndexClient, Package, PackageIndex,
     mirror::{
         CheckSummary, DownloadQueueStub, FileState, MirrorLayout, PackageMetadata, check_package,
         inspect_file, sample_packages,
@@ -31,7 +31,7 @@ fn parse(input: &str, layout: &MirrorLayout) -> anyhow::Result<PackageMetadata> 
     PackageMetadata::from_reader(
         input.as_bytes(),
         package(),
-        Url::parse("https://pypi.org/pypi/example-pkg/json").unwrap(),
+        Url::parse("https://pypi.org/simple/example-pkg/").unwrap(),
         layout,
     )
 }
@@ -42,6 +42,7 @@ fn includes_all_versions_files_urls_sizes_and_paths() {
     let layout = MirrorLayout::create(directory.path()).unwrap();
     let metadata = parse(FIXTURE, &layout).unwrap();
     assert_eq!(metadata.releases.len(), 3);
+    assert_eq!(metadata.last_serial, Some(12345));
     assert!(metadata.releases[0].files.is_empty());
     let file = &metadata.releases[1].files[0];
     assert_eq!(metadata.releases[1].version, "1.0");
@@ -63,6 +64,189 @@ fn includes_all_versions_files_urls_sizes_and_paths() {
     assert!(metadata.package_path.is_dir());
     assert!(metadata.metadata_path.is_file());
     assert_eq!(fs::read_dir(&metadata.package_path).unwrap().count(), 0);
+}
+
+#[test]
+fn resolves_relative_urls_and_accepts_yanked_reasons() {
+    let directory = tempdir().unwrap();
+    let layout = MirrorLayout::create(directory.path()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    value["files"][0]["url"] = "../../files/a.whl#sha256=abc123".into();
+    value["files"][1]["url"] = "/files/b.tar.gz".into();
+    value["files"][2]["url"] = "//cdn.example.org/c.whl".into();
+    value["files"][0]["yanked"] = "Broken release".into();
+    value["files"][1]["yanked"] = "".into();
+    let metadata = parse(&value.to_string(), &layout).unwrap();
+    assert_eq!(
+        metadata.releases[1].files[0].download_url.as_str(),
+        "https://pypi.org/files/a.whl#sha256=abc123"
+    );
+    assert_eq!(
+        metadata.releases[1].files[1].download_url.as_str(),
+        "https://pypi.org/files/b.tar.gz"
+    );
+    assert_eq!(
+        metadata.releases[2].files[0].download_url.as_str(),
+        "https://cdn.example.org/c.whl"
+    );
+    assert!(metadata.releases[1].files[0].yanked);
+    assert!(!metadata.releases[1].files[1].yanked);
+    assert!(metadata.releases[2].files[0].yanked);
+}
+
+fn simple(versions: &[&str], filenames: &[&str]) -> serde_json::Value {
+    serde_json::json!({"name": "Example_Pkg", "meta": {"api-version": "1.4"}, "versions": versions,
+        "files": filenames.iter().map(|name| serde_json::json!({"filename": name, "url": name, "size": 1, "hashes": {}})).collect::<Vec<_>>()})
+}
+
+#[test]
+fn groups_normalized_versions_build_wheels_and_legacy_distributions() {
+    let directory = tempdir().unwrap();
+    let layout = MirrorLayout::create(directory.path()).unwrap();
+    let value = simple(
+        &["0.6rc11", "1.0-1", "2.0", "empty", "legacy-foo"],
+        &[
+            "example_pkg-1.0.post1-py3-none-any.whl",
+            "example_pkg-2.0-3-py3-none-any.whl",
+            "Example-Pkg-legacy-foo.tar.gz",
+            "example_pkg-2.0-py2.7.egg",
+            "example_pkg-2.0.win32.exe",
+            "example_pkg-1.0.post1-py2.7.egg",
+            "example_pkg-1.0.post1.win32.exe",
+            "example_pkg-0.6c11-py2.7.egg",
+        ],
+    );
+    let metadata = parse(&value.to_string(), &layout).unwrap();
+    let release = |name: &str| {
+        metadata
+            .releases
+            .iter()
+            .find(|release| release.version == name)
+            .unwrap()
+    };
+    assert_eq!(release("1.0-1").files.len(), 3);
+    assert_eq!(release("0.6rc11").files.len(), 1);
+    assert_eq!(release("2.0").files.len(), 3);
+    assert_eq!(release("legacy-foo").files.len(), 1);
+    assert!(release("empty").files.is_empty());
+    assert_eq!(
+        release("2.0").files[0].package_type.as_deref(),
+        Some("bdist_wheel")
+    );
+    assert_eq!(
+        release("2.0").files[1].package_type.as_deref(),
+        Some("bdist_egg")
+    );
+}
+
+#[test]
+fn infers_versions_when_older_simple_response_omits_versions() {
+    let directory = tempdir().unwrap();
+    let layout = MirrorLayout::create(directory.path()).unwrap();
+    let mut value = simple(
+        &[],
+        &["example_pkg-1.0.tar.gz", "example_pkg-2.0-py3-none-any.whl"],
+    );
+    value.as_object_mut().unwrap().remove("versions");
+    value["meta"]["api-version"] = "1.0".into();
+    let metadata = parse(&value.to_string(), &layout).unwrap();
+    assert_eq!(
+        metadata
+            .releases
+            .iter()
+            .map(|release| release.version.as_str())
+            .collect::<Vec<_>>(),
+        ["1.0", "2.0"]
+    );
+    assert_eq!(metadata.last_serial, None);
+}
+
+#[test]
+fn rejects_ambiguous_unlisted_and_malformed_simple_metadata() {
+    let directory = tempdir().unwrap();
+    let layout = MirrorLayout::create(directory.path()).unwrap();
+    for value in [
+        simple(&["1.0", "1.0.0"], &["example_pkg-1.0.00-py3-none-any.whl"]),
+        simple(&["1.0", "2.0"], &["example_pkg-3.0.tar.gz"]),
+        simple(&["1.0", "2.0"], &["opaque.blob"]),
+        simple(&[], &["example_pkg-1.0.tar.gz"]),
+        simple(&[""], &[]),
+        serde_json::json!({"info": {"name": "Example_Pkg"}, "releases": {}}),
+    ] {
+        assert!(
+            parse(&value.to_string(), &layout).is_err(),
+            "accepted {value}"
+        );
+    }
+    let mut value = simple(&["1.0"], &["example_pkg-1.0.tar.gz"]);
+    value["meta"]["api-version"] = "2.0".into();
+    assert!(parse(&value.to_string(), &layout).is_err());
+    value["meta"]["api-version"] = "1.4".into();
+    value["files"][0].as_object_mut().unwrap().remove("hashes");
+    assert!(parse(&value.to_string(), &layout).is_err());
+    let empty = parse(&simple(&[], &[]).to_string(), &layout).unwrap();
+    assert!(empty.releases.is_empty());
+}
+
+#[test]
+fn fetches_simple_json_and_resolves_files_against_redirected_page() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for position in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0; 1024];
+                let size = stream.read(&mut bytes).unwrap();
+                assert!(size > 0);
+                request.extend_from_slice(&bytes[..size]);
+                if request.windows(4).any(|chunk| chunk == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            requests.push(String::from_utf8(request).unwrap());
+            if position == 0 {
+                write!(stream, "HTTP/1.1 302 Found\r\nLocation: /repository/project.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            } else {
+                let mut response = simple(&["1.0"], &["example_pkg-1.0.tar.gz"]);
+                response["files"][0]["url"] = "../files/example_pkg-1.0.tar.gz".into();
+                let body = response.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.pypi.simple.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+        requests
+    });
+    let directory = tempdir().unwrap();
+    let layout = MirrorLayout::create(directory.path()).unwrap();
+    let metadata = IndexClient::new()
+        .unwrap()
+        .fetch_metadata(
+            package(),
+            format!("{base}/simple/").parse().unwrap(),
+            &layout,
+        )
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(requests[0].starts_with("GET /simple/example-pkg/ HTTP/1.1\r\n"));
+    assert!(requests[1].starts_with("GET /repository/project.json HTTP/1.1\r\n"));
+    assert!(requests.iter().all(|request| {
+        request
+            .to_ascii_lowercase()
+            .contains("accept: application/vnd.pypi.simple.v1+json\r\n")
+    }));
+    assert_eq!(
+        metadata.metadata_url.as_str(),
+        format!("{base}/repository/project.json")
+    );
+    assert_eq!(
+        metadata.releases[0].files[0].download_url.as_str(),
+        format!("{base}/files/example_pkg-1.0.tar.gz")
+    );
 }
 
 #[test]
@@ -131,7 +315,7 @@ fn rejects_unsafe_filenames_wrong_project_and_missing_sizes() {
         "",
     ] {
         let mut value: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
-        value["releases"]["1.0"][0]["filename"] = filename.into();
+        value["files"][0]["filename"] = filename.into();
         assert!(
             parse(&value.to_string(), &layout).is_err(),
             "accepted {filename}"
@@ -200,7 +384,7 @@ fn random_sample_is_unique_and_reproducible() {
 #[test]
 fn cli_saves_metadata_and_report_and_continues_after_package_errors() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}/pypi/", listener.local_addr().unwrap());
+    let base = format!("http://{}/simple/", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
         let mut requests = Vec::new();
         for _ in 0..3 {
@@ -219,7 +403,7 @@ fn cli_saves_metadata_and_report_and_continues_after_package_errors() {
                 }
             }
             let request = String::from_utf8(request).unwrap();
-            let (status, body) = if request.starts_with("GET /pypi/example-pkg/json ") {
+            let (status, body) = if request.starts_with("GET /simple/example-pkg/ ") {
                 ("200 OK", FIXTURE)
             } else {
                 ("404 Not Found", "missing")
@@ -292,7 +476,7 @@ fn cli_saves_metadata_and_report_and_continues_after_package_errors() {
     assert!(
         requests[1]
             .to_lowercase()
-            .contains("accept: application/json\r\n")
+            .contains("accept: application/vnd.pypi.simple.v1+json\r\n")
     );
     assert!(
         output.status.success(),

@@ -132,7 +132,7 @@ fn reply(mode: Mode, address: SocketAddr, request: &str) -> (&'static str, Vec<u
         "/simple/" => {
             serde_json::json!({"meta": {"api-version": "1.0"}, "projects": [{"name": "proxy-fixture"}]})
         }
-        "/pypi/proxy-fixture/json" => {
+        "/simple/proxy-fixture/" => {
             let download = if secure_artifacts {
                 "https://files.invalid/artifact.whl".into()
             } else if proxy {
@@ -140,10 +140,10 @@ fn reply(mode: Mode, address: SocketAddr, request: &str) -> (&'static str, Vec<u
             } else {
                 format!("http://{address}/artifact.whl")
             };
-            serde_json::json!({"info": {"name": "proxy-fixture"}, "releases": {"1.0": [{
+            serde_json::json!({"name": "proxy-fixture", "meta": {"api-version": "1.4"}, "versions": ["1.0"], "files": [{
                 "filename": "artifact.whl", "url": download, "size": ARTIFACT.len(),
-                "digests": {"sha256": format!("{:x}", Sha256::digest(ARTIFACT))}
-            }]}})
+                "hashes": {"sha256": format!("{:x}", Sha256::digest(ARTIFACT))}
+            }]})
         }
         "/artifact.whl" => return ("200 OK", ARTIFACT.to_vec()),
         _ => return ("404 Not Found", Vec::new()),
@@ -209,7 +209,7 @@ fn http_and_all_proxy_variables_route_index_metadata_and_downloads() {
         let mut command = mirror(
             root.path(),
             "http://index.invalid/simple/",
-            "http://metadata.invalid/pypi/",
+            "http://metadata.invalid/simple/",
         );
         if name.eq_ignore_ascii_case("http_proxy") {
             // Protocol-specific settings must take priority over ALL_PROXY.
@@ -221,7 +221,7 @@ fn http_and_all_proxy_variables_route_index_metadata_and_downloads() {
         assert_eq!(requests.len(), 3, "{name}");
         for (request, target) in requests.iter().zip([
             "http://index.invalid/simple/",
-            "http://metadata.invalid/pypi/proxy-fixture/json",
+            "http://metadata.invalid/simple/proxy-fixture/",
             "http://files.invalid/artifact.whl",
         ]) {
             assert!(
@@ -244,7 +244,7 @@ fn no_proxy_variables_bypass_proxy_for_all_request_types() {
         let output = mirror(
             root.path(),
             &format!("{}/simple/", origin.url()),
-            &format!("{}/pypi/", origin.url()),
+            &format!("{}/simple/", origin.url()),
         )
         .env("HTTP_PROXY", proxy.url())
         .env("ALL_PROXY", proxy.url())
@@ -298,7 +298,7 @@ fn https_proxy_is_used_by_download_workers() {
         let output = mirror(
             root.path(),
             &format!("{}/simple/", origin.url()),
-            &format!("{}/pypi/", origin.url()),
+            &format!("{}/simple/", origin.url()),
         )
         .env(name, proxy.url())
         .output()
@@ -328,7 +328,7 @@ fn proxy_url_credentials_are_used_for_http_requests_and_connect() {
     let output = mirror(
         root.path(),
         "http://index.invalid/simple/",
-        "http://metadata.invalid/pypi/",
+        "http://metadata.invalid/simple/",
     )
     .env("HTTP_PROXY", format!("http://user:pass@{}", proxy.address))
     .output()

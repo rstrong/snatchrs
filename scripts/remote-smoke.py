@@ -23,12 +23,12 @@ def main():
             requests.append(self.path)
             if self.path == "/simple/":
                 body = json.dumps({"meta": {"api-version": "1.0"}, "projects": [{"name": "remote-smoke"}]}).encode()
-            elif self.path == "/pypi/remote-smoke/json":
-                body = json.dumps({"info": {"name": "remote-smoke"}, "releases": {"1.0": [
+            elif self.path == "/simple/remote-smoke/":
+                body = json.dumps({"name": "remote-smoke", "meta": {"api-version": "1.4"}, "versions": ["1.0"], "files": [
                     {"filename": name, "url": f"http://127.0.0.1:{self.server.server_port}/{name}",
-                     "size": len(data), "digests": {"sha256": hashlib.sha256(data).hexdigest()}}
+                     "size": len(data), "hashes": {"sha256": hashlib.sha256(data).hexdigest()}}
                     for name, data in bodies.items()
-                ]}}).encode()
+                ]}).encode()
             else:
                 body = bodies[self.path.lstrip("/")]
             self.send_response(200)
@@ -45,7 +45,7 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="snatchrs-smoke-", dir=args.temp_root) as directory:
             root = Path(directory)
-            common = ["--mirror", str(root), "--package", "remote-smoke", "--metadata-url", f"http://127.0.0.1:{server.server_port}/pypi/", "--json"]
+            common = ["--mirror", str(root), "--package", "remote-smoke", "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/", "--json"]
 
             def run(command, *extra):
                 result = subprocess.run([str(args.binary.resolve()), command, *common, *extra], capture_output=True, text=True, timeout=30)
@@ -73,7 +73,7 @@ def main():
             result = subprocess.run([
                 str(args.binary.resolve()), "mirror", "--sample", "10000",
                 "--mirror", str(root), "--index-url", f"http://127.0.0.1:{server.server_port}/simple/",
-                "--metadata-url", f"http://127.0.0.1:{server.server_port}/pypi/", "--json"
+                "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/", "--json"
             ], capture_output=True, text=True, timeout=30)
             if result.returncode:
                 raise RuntimeError(result.stderr)

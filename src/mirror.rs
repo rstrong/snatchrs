@@ -10,9 +10,13 @@ use rand::{SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::{IndexClient, Package, PackageIndex, normalize_index_url, normalize_name};
+use crate::{
+    IndexClient, JSON_MEDIA_TYPE, Package, PackageIndex,
+    filename::{ReleaseNames, package_type},
+    normalize_index_url, normalize_name,
+};
 
-pub const DEFAULT_METADATA_URL: &str = "https://pypi.org/pypi/";
+pub const DEFAULT_METADATA_URL: &str = crate::DEFAULT_INDEX_URL;
 
 /// A release can contain many wheels and source distributions, or no files.
 #[derive(Debug, Serialize)]
@@ -52,36 +56,44 @@ impl PackageMetadata {
         layout: &MirrorLayout,
     ) -> Result<Self> {
         let raw: RawMetadata = serde_json::from_reader(BufReader::new(reader))
-            .context("Invalid project JSON metadata (requires the releases field)")?;
+            .context("Invalid per-project Simple Index JSON metadata")?;
         ensure!(
-            normalize_name(&raw.info.name)? == package.normalized_name,
+            raw.meta.api_version.split('.').next() == Some("1"),
+            "Unsupported Simple Index API version: {}",
+            raw.meta.api_version
+        );
+        ensure!(
+            normalize_name(&raw.name)? == package.normalized_name,
             "Metadata package name does not match {}",
             package.name
         );
         let package_path = layout.package_path(&package.normalized_name)?;
-        let mut releases = Vec::with_capacity(raw.releases.len());
-        for (version, files) in raw.releases {
-            let files = files
-                .into_iter()
-                .map(|file| {
-                    validate_filename(&file.filename)?;
-                    ensure!(
-                        matches!(file.url.scheme(), "https" | "http"),
-                        "File URL must use HTTP or HTTPS"
-                    );
-                    Ok(DistributionFile {
-                        local_path: package_path.join(&file.filename),
-                        filename: file.filename,
-                        download_url: file.url,
-                        size: file.size,
-                        sha256: file.digests.get("sha256").cloned(),
-                        package_type: file.packagetype,
-                        requires_python: file.requires_python,
-                        yanked: file.yanked,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            releases.push(Release { version, files });
+        let names = ReleaseNames::new(raw.versions)?;
+        let mut releases: BTreeMap<String, Vec<DistributionFile>> = names
+            .names()
+            .map(|name| (name.clone(), Vec::new()))
+            .collect();
+        for file in raw.files {
+            validate_filename(&file.filename)?;
+            let url = metadata_url
+                .join(&file.url)
+                .context("Invalid distribution URL")?;
+            ensure!(
+                matches!(url.scheme(), "https" | "http"),
+                "File URL must use HTTP or HTTPS"
+            );
+            let version = names.version(&file.filename, &package.normalized_name)?;
+            let package_type = package_type(&file.filename);
+            releases.entry(version).or_default().push(DistributionFile {
+                local_path: package_path.join(&file.filename),
+                filename: file.filename,
+                download_url: url,
+                size: file.size,
+                sha256: file.hashes.get("sha256").cloned(),
+                package_type,
+                requires_python: file.requires_python,
+                yanked: file.yanked.is_yanked(),
+            });
         }
         Ok(Self {
             metadata_path: layout
@@ -91,14 +103,17 @@ impl PackageMetadata {
             package_path,
             package,
             metadata_url,
-            last_serial: raw.last_serial,
-            releases,
+            last_serial: raw.meta.last_serial,
+            releases: releases
+                .into_iter()
+                .map(|(version, files)| Release { version, files })
+                .collect(),
         })
     }
 }
 
 impl IndexClient {
-    /// PyPI-specific adapter: one project JSON request covers every release.
+    /// One per-project Simple JSON request covers all advertised files/versions.
     pub fn fetch_metadata(
         &self,
         package: Package,
@@ -106,16 +121,17 @@ impl IndexClient {
         layout: &MirrorLayout,
     ) -> Result<PackageMetadata> {
         let base = normalize_index_url(metadata_base)?;
-        let url = base.join(&format!("{}/json", normalize_name(&package.name)?))?;
+        let url = base.join(&format!("{}/", normalize_name(&package.name)?))?;
         let response = self
             .client
             .get(url.clone())
-            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::ACCEPT, JSON_MEDIA_TYPE)
             .send()
             .context("Failed to fetch project metadata")?
             .error_for_status()
             .context("Project metadata returned an HTTP error")?;
-        PackageMetadata::from_reader(response, package, url, layout)
+        let effective_url = response.url().clone();
+        PackageMetadata::from_reader(response, package, effective_url, layout)
     }
 }
 
@@ -301,27 +317,50 @@ pub fn sample_packages(index: &PackageIndex, count: usize, seed: u64) -> Vec<Pac
 
 #[derive(Deserialize)]
 struct RawMetadata {
-    info: RawInfo,
-    releases: BTreeMap<String, Vec<RawFile>>,
-    last_serial: Option<u64>,
+    name: String,
+    meta: RawMeta,
+    versions: Option<Vec<String>>,
+    files: Vec<RawFile>,
 }
 
 #[derive(Deserialize)]
-struct RawInfo {
-    name: String,
+struct RawMeta {
+    #[serde(rename = "api-version")]
+    api_version: String,
+    #[serde(rename = "_last-serial")]
+    last_serial: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct RawFile {
     filename: String,
-    url: Url,
+    url: String,
     size: u64,
-    #[serde(default)]
-    digests: BTreeMap<String, String>,
-    packagetype: Option<String>,
+    hashes: BTreeMap<String, String>,
+    #[serde(rename = "requires-python")]
     requires_python: Option<String>,
     #[serde(default)]
-    yanked: bool,
+    yanked: Yanked,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Yanked {
+    Flag(bool),
+    Reason(String),
+}
+impl Default for Yanked {
+    fn default() -> Self {
+        Self::Flag(false)
+    }
+}
+impl Yanked {
+    fn is_yanked(&self) -> bool {
+        match self {
+            Self::Flag(flag) => *flag,
+            Self::Reason(reason) => !reason.is_empty(),
+        }
+    }
 }
 
 fn validate_filename(filename: &str) -> Result<()> {
