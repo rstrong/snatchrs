@@ -214,6 +214,7 @@ fn fetches_simple_json_and_resolves_files_against_redirected_page() {
                 write!(stream, "HTTP/1.1 302 Found\r\nLocation: /repository/project.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             } else {
                 let mut response = simple(&["1.0"], &["example_pkg-1.0.tar.gz"]);
+                response["meta"]["_last-serial"] = 12345.into();
                 response["files"][0]["url"] = "../files/example_pkg-1.0.tar.gz".into();
                 let body = response.to_string();
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.pypi.simple.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -246,6 +247,25 @@ fn fetches_simple_json_and_resolves_files_against_redirected_page() {
     assert_eq!(
         metadata.releases[0].files[0].download_url.as_str(),
         format!("{base}/files/example_pkg-1.0.tar.gz")
+    );
+    // The cache is keyed by the requested endpoint, retaining redirected URLs
+    // for resolving files. The server has stopped, so another fetch would fail.
+    layout.save_metadata(&metadata).unwrap();
+    let mut current = package();
+    current.last_serial = Some(12345);
+    let cached = IndexClient::with_attempts(1)
+        .unwrap()
+        .load_metadata(
+            current,
+            format!("{base}/simple/").parse().unwrap(),
+            &layout,
+            false,
+        )
+        .unwrap();
+    assert_eq!(cached.metadata_url, metadata.metadata_url);
+    assert_eq!(
+        cached.releases[0].files[0].download_url,
+        metadata.releases[0].files[0].download_url
     );
 }
 

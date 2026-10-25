@@ -36,6 +36,9 @@ pub struct CheckArgs {
     /// Override the per-project Simple Index base (defaults to --index-url).
     #[arg(long)]
     metadata_url: Option<Url>,
+    /// Fetch fresh project metadata even when its cached serial is unchanged.
+    #[arg(long)]
+    refresh: bool,
     /// Print the summary report as JSON (details are stored in JSONL files).
     #[arg(long)]
     json: bool,
@@ -211,6 +214,7 @@ fn run_inner(
                 quiet,
                 no_progress,
                 json: args.json,
+                refresh: args.refresh,
             },
         );
     }
@@ -220,12 +224,7 @@ fn run_inner(
         if let Some(dashboard) = &dashboard {
             dashboard.checking(position, total, &name, &report.summary);
         }
-        let result = client
-            .fetch_metadata(package, metadata_url.clone(), &layout)
-            .and_then(|metadata| {
-                layout.save_metadata(&metadata)?;
-                Ok(metadata)
-            });
+        let result = client.load_metadata(package, metadata_url.clone(), &layout, args.refresh);
         match result {
             Ok(metadata) => {
                 let checked = check_package(metadata, &mut report.summary, &mut report.queue_stub);
@@ -330,6 +329,7 @@ struct OutputOptions {
     quiet: bool,
     no_progress: bool,
     json: bool,
+    refresh: bool,
 }
 
 fn run_pipeline(
@@ -345,6 +345,7 @@ fn run_pipeline(
         quiet,
         no_progress,
         json,
+        refresh,
     } = output;
     let outcomes_path = inspection
         .0
@@ -363,7 +364,17 @@ fn run_pipeline(
     let (inspection, downloads) = snatchrs::download::download_stream_to(
         &layout.root,
         options,
-        |queue| inspect_stream(queue, layout, client, metadata_url, packages, inspection),
+        |queue| {
+            inspect_stream(
+                queue,
+                layout,
+                client,
+                metadata_url,
+                packages,
+                inspection,
+                refresh,
+            )
+        },
         |progress| {
             if let Some(ui) = ui.as_mut() {
                 ui.update(progress);
@@ -483,6 +494,7 @@ fn inspect_stream(
     metadata_url: Url,
     packages: Vec<Package>,
     inspection: (CheckReport, InspectionJournal),
+    refresh: bool,
 ) -> Result<CheckReport> {
     let (mut report, mut journal) = inspection;
     let total = packages.len();
@@ -490,12 +502,7 @@ fn inspect_stream(
     for (position, package) in packages.into_iter().enumerate() {
         let name = package.normalized_name.clone();
         queue.discovery(discovery(&report, total, position, &name))?;
-        let result = client
-            .fetch_metadata(package, metadata_url.clone(), layout)
-            .and_then(|metadata| {
-                layout.save_metadata(&metadata)?;
-                Ok(metadata)
-            });
+        let result = client.load_metadata(package, metadata_url.clone(), layout, refresh);
         let mut stop = false;
         match result {
             Ok(metadata) => {

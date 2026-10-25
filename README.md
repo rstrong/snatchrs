@@ -148,6 +148,25 @@ and yanked state.
 metadata follow `--index-url` by default. `--metadata-url` optionally overrides
 the Simple Index base for project metadata; it takes a Simple API base URL.
 
+On sampled runs, `check` and `mirror` reuse saved project metadata when the current
+root listing's `_last-serial` matches the cached project's serial. Caches are bound
+to both the root-listing project URL and the requested metadata URL (before
+redirects). Missing, older-format, malformed, or invalid caches are fetched again;
+changed serials also trigger a fetch. The project's `X-PyPI-Last-Serial` header is
+used when its JSON body omits the serial. A missing serial never counts as a match.
+Local files are checked every run, including cache hits, so interrupted downloads,
+deleted files, and wrong sizes are still queued for repair.
+
+Use `--refresh` to force fresh metadata for every selected project:
+
+```bash
+./target/release/snatchrs mirror --mirror ./mirror-shell --sample 10000 --refresh
+```
+
+Explicit `--package` selection does not fetch the root listing and therefore
+always fetches metadata. Failed refreshes report an error and preserve the previous
+cache; they do not silently fall back to potentially stale metadata.
+
 The API's flat `files` list supplies URLs, sizes, `hashes`, `requires-python`, and
 boolean or string `yanked` values. Relative file URLs are resolved against the
 final response URL, including redirects. Files are grouped into the advertised

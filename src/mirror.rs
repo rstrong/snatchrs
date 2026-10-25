@@ -41,6 +41,9 @@ pub struct DistributionFile {
 pub struct PackageMetadata {
     pub package: Package,
     pub metadata_url: Url,
+    /// Requested project endpoint before redirects; absent in older cache files.
+    #[serde(default)]
+    pub metadata_source_url: Option<Url>,
     pub metadata_path: PathBuf,
     pub package_path: PathBuf,
     pub last_serial: Option<u64>,
@@ -104,6 +107,7 @@ impl PackageMetadata {
             package_path,
             package,
             metadata_url,
+            metadata_source_url: None,
             last_serial: raw.meta.last_serial,
             releases: releases
                 .into_iter()
@@ -114,6 +118,30 @@ impl PackageMetadata {
 }
 
 impl IndexClient {
+    /// Reuse valid same-source metadata only when its project serial matches the
+    /// current root listing. A serial never proves that local artifacts exist.
+    pub fn load_metadata(
+        &self,
+        package: Package,
+        metadata_base: Url,
+        layout: &MirrorLayout,
+        refresh: bool,
+    ) -> Result<PackageMetadata> {
+        let source = normalize_index_url(metadata_base.clone())?
+            .join(&format!("{}/", normalize_name(&package.name)?))?;
+        if !refresh
+            && package.last_serial.is_some()
+            && let Some(mut metadata) = layout.cached_metadata(&package, &source)
+        {
+            // Preserve current root-index knowledge when reusing project data.
+            metadata.package = package;
+            return Ok(metadata);
+        }
+        let metadata = self.fetch_metadata(package, metadata_base, layout)?;
+        layout.save_metadata(&metadata)?;
+        Ok(metadata)
+    }
+
     /// One per-project Simple JSON request covers all advertised files/versions.
     pub fn fetch_metadata(
         &self,
@@ -130,7 +158,16 @@ impl IndexClient {
             self.attempts,
             |response| {
                 let effective_url = response.url().clone();
-                PackageMetadata::from_reader(response, package.clone(), effective_url, layout)
+                let header_serial = response
+                    .headers()
+                    .get("x-pypi-last-serial")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                let mut metadata =
+                    PackageMetadata::from_reader(response, package.clone(), effective_url, layout)?;
+                metadata.metadata_source_url = Some(url.clone());
+                metadata.last_serial = metadata.last_serial.or(header_serial);
+                Ok(metadata)
             },
         )
         .context("Failed to fetch project metadata")
@@ -167,6 +204,41 @@ impl MirrorLayout {
 
     pub fn package_path(&self, name: &str) -> Result<PathBuf> {
         Ok(self.root.join("packages").join(normalize_name(name)?))
+    }
+
+    fn cached_metadata(&self, package: &Package, source: &Url) -> Option<PackageMetadata> {
+        // Cache absence, old schema, malformed data, and invalid paths all fall
+        // back to the network rather than failing the project inspection.
+        let path = self
+            .root
+            .join("metadata")
+            .join(format!("{}.json", package.normalized_name));
+        let metadata: PackageMetadata =
+            serde_json::from_reader(BufReader::new(fs::File::open(&path).ok()?)).ok()?;
+        let package_path = self.package_path(&package.normalized_name).ok()?;
+        if metadata.last_serial != package.last_serial
+            || metadata.metadata_source_url.as_ref() != Some(source)
+            || metadata.package.index_url != package.index_url
+            || metadata.package.normalized_name != package.normalized_name
+            || normalize_name(&metadata.package.name).ok().as_ref()
+                != Some(&package.normalized_name)
+            || metadata.metadata_path != path
+            || metadata.package_path != package_path
+            || !matches!(metadata.metadata_url.scheme(), "http" | "https")
+        {
+            return None;
+        }
+        for file in metadata.releases.iter().flat_map(|release| &release.files) {
+            if validate_filename(&file.filename).is_err()
+                || file.local_path != package_path.join(&file.filename)
+                || !matches!(file.download_url.scheme(), "http" | "https")
+            {
+                return None;
+            }
+        }
+        // Retain the normal directory/symlink checks even on a cache hit.
+        create_directory(&package_path).ok()?;
+        Some(metadata)
     }
 
     pub fn save_metadata(&self, metadata: &PackageMetadata) -> Result<()> {
