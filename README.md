@@ -173,6 +173,23 @@ Use `--refresh` to force fresh metadata for every selected project:
 ./target/release/snatchrs mirror --mirror ./mirror-shell --sample 10000 --refresh
 ```
 
+Both commands fetch project metadata with a bounded worker pool:
+`--metadata-concurrency` defaults to 4 and accepts 1–32. It is independent of
+`mirror --concurrency`, which controls artifact downloads. Results are checked,
+journaled, and queued as they finish, so a slow request or retry does not block
+other metadata workers. Completed metadata is buffered in a bounded channel;
+large samples do not accumulate all results in memory. Lower the metadata worker
+count if individual projects have very large metadata responses.
+
+```bash
+./target/release/snatchrs mirror --mirror ./mirror-shell --sample 10000 --metadata-concurrency 8 --concurrency 16
+```
+
+Detail records and plain package output follow completion order. The summary's
+`selected_packages` list still records the original selection order, and
+`metadata_concurrency` records the configured limit. Use
+`--metadata-concurrency 1` for sequential metadata requests.
+
 Explicit `--package` selection does not fetch the root listing and therefore
 always fetches metadata. Failed refreshes report an error and preserve the previous
 cache; they do not silently fall back to potentially stale metadata.
@@ -280,8 +297,8 @@ read one checked package at a time. `--json` prints the compact summary, using t
 same format as the saved report. The previous inline `packages`, `errors`, and
 `downloads.outcomes` arrays have been replaced by the JSONL paths above; consumers
 should stream those files line by line. Selected names and queue deduplication
-fingerprints are still retained in memory, and a single project's metadata must
-fit in memory.
+fingerprints are still retained in memory. Metadata held by active workers and
+the bounded result buffer must also fit in memory.
 
 Each run has its own detail directory. Earlier report paths remain readable after
 subsequent runs; completed and interrupted run directories are kept for inspection

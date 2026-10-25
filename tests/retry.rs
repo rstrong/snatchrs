@@ -403,6 +403,8 @@ fn project_404_is_not_retried_and_later_projects_are_still_checked() {
                 "retry-fixture",
                 "--attempts",
                 "5",
+                "--metadata-concurrency",
+                "1",
                 "--metadata-url",
                 &format!("{}/simple/", server.url),
                 "--json",

@@ -2,6 +2,12 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Write},
     path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -36,12 +42,81 @@ pub struct CheckArgs {
     /// Override the per-project Simple Index base (defaults to --index-url).
     #[arg(long)]
     metadata_url: Option<Url>,
+    /// Simultaneous project metadata requests (1–32), separate from downloads.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=32))]
+    metadata_concurrency: u16,
     /// Fetch fresh project metadata even when its cached serial is unchanged.
     #[arg(long)]
     refresh: bool,
     /// Print the summary report as JSON (details are stored in JSONL files).
     #[arg(long)]
     json: bool,
+}
+
+struct MetadataOptions {
+    base: Url,
+    refresh: bool,
+    concurrency: usize,
+}
+
+// Fetches finish out of order. Only this bounded channel crosses back to the
+// single journal/check/queue consumer, so a slow project cannot block its peers
+// or cause an unbounded accumulation of completed metadata in memory.
+fn parallel_metadata(
+    packages: Vec<Package>,
+    client: &IndexClient,
+    layout: &MirrorLayout,
+    options: &MetadataOptions,
+    mut consume: impl FnMut(String, Result<MetadataOutcome>) -> Result<bool>,
+) -> Result<()> {
+    let workers = options.concurrency.min(packages.len());
+    let jobs = Mutex::new(packages.into_iter());
+    let cancelled = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let (sender, receiver) = mpsc::sync_channel(workers.max(1));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let jobs = &jobs;
+            let cancelled = &cancelled;
+            handles.push(scope.spawn(move || {
+                while !cancelled.load(Ordering::Acquire) {
+                    let Some(package) = jobs.lock().unwrap_or_else(|p| p.into_inner()).next()
+                    else {
+                        break;
+                    };
+                    let name = package.normalized_name.clone();
+                    let result = client.load_metadata(
+                        package,
+                        options.base.clone(),
+                        layout,
+                        options.refresh,
+                    );
+                    if sender.send((name, result)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(sender);
+        let consumed = (|| {
+            for (name, result) in &receiver {
+                if !consume(name, result)? {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        cancelled.store(true, Ordering::Release);
+        // Release blocked sends before joining, including on report/queue errors.
+        drop(receiver);
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("Metadata worker panicked"))?;
+        }
+        consumed
+    })
 }
 
 #[derive(Serialize)]
@@ -53,6 +128,7 @@ struct PackageError {
 #[derive(Serialize)]
 struct CheckReport {
     mirror_root: PathBuf,
+    metadata_concurrency: usize,
     seed: Option<u64>,
     selected_packages: Vec<String>,
     summary: CheckSummary,
@@ -162,6 +238,11 @@ fn run_inner(
         .metadata_url
         .clone()
         .unwrap_or_else(|| args.index_url.clone());
+    let metadata_options = MetadataOptions {
+        base: metadata_url,
+        refresh: args.refresh,
+        concurrency: usize::from(args.metadata_concurrency),
+    };
     let seed = args
         .packages
         .is_empty()
@@ -211,6 +292,7 @@ fn run_inner(
     };
     let mut report = CheckReport {
         mirror_root: PathBuf::from("."),
+        metadata_concurrency: metadata_options.concurrency,
         seed,
         selected_packages: packages
             .iter()
@@ -233,61 +315,61 @@ fn run_inner(
             &client,
             packages,
             (report, journal),
-            metadata_url,
+            metadata_options,
             options,
             OutputOptions {
                 quiet,
                 no_progress,
                 json: args.json,
-                refresh: args.refresh,
             },
         );
     }
     let total = packages.len();
-    for (position, package) in packages.into_iter().enumerate() {
-        let name = package.normalized_name.clone();
-        if let Some(dashboard) = &dashboard {
-            dashboard.checking(
-                position,
-                total,
-                &name,
-                &report.summary,
-                report.unavailable_count,
-            );
-        }
-        let result = client.load_metadata(package, metadata_url.clone(), &layout, args.refresh);
-        match result {
-            Ok(MetadataOutcome::Available(metadata)) => {
-                let checked = check_package(
-                    &layout.root,
-                    *metadata,
-                    &mut report.summary,
-                    &mut report.queue_stub,
-                );
-                append_jsonl(&mut journal.packages, &checked)?;
-            }
-            Ok(MetadataOutcome::NotFound { metadata_url }) => {
-                record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
-            }
-            Err(error) => record_error(
-                &mut report,
-                &mut journal,
-                PackageError {
-                    name: name.clone(),
-                    error: format!("{error:#}"),
-                },
-            )?,
-        }
-        if let Some(dashboard) = &dashboard {
-            dashboard.checking(
-                position + 1,
-                total,
-                &name,
-                &report.summary,
-                report.unavailable_count,
-            );
-        }
+    let mut completed = 0;
+    if let Some(dashboard) = &dashboard {
+        dashboard.checking(0, total, "fetching metadata", &report.summary, 0);
     }
+    parallel_metadata(
+        packages,
+        &client,
+        &layout,
+        &metadata_options,
+        |name, result| {
+            match result {
+                Ok(MetadataOutcome::Available(metadata)) => {
+                    let checked = check_package(
+                        &layout.root,
+                        *metadata,
+                        &mut report.summary,
+                        &mut report.queue_stub,
+                    );
+                    append_jsonl(&mut journal.packages, &checked)?;
+                }
+                Ok(MetadataOutcome::NotFound { metadata_url }) => {
+                    record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
+                }
+                Err(error) => record_error(
+                    &mut report,
+                    &mut journal,
+                    PackageError {
+                        name: name.clone(),
+                        error: format!("{error:#}"),
+                    },
+                )?,
+            }
+            completed += 1;
+            if let Some(dashboard) = &dashboard {
+                dashboard.checking(
+                    completed,
+                    total,
+                    &name,
+                    &report.summary,
+                    report.unavailable_count,
+                );
+            }
+            Ok(true)
+        },
+    )?;
     journal.packages.get_ref().sync_all()?;
     journal.errors.get_ref().sync_all()?;
     journal.unavailable.get_ref().sync_all()?;
@@ -381,7 +463,6 @@ struct OutputOptions {
     quiet: bool,
     no_progress: bool,
     json: bool,
-    refresh: bool,
 }
 
 fn run_pipeline(
@@ -389,7 +470,7 @@ fn run_pipeline(
     client: &IndexClient,
     packages: Vec<Package>,
     inspection: (CheckReport, InspectionJournal),
-    metadata_url: Url,
+    metadata_options: MetadataOptions,
     options: snatchrs::download::DownloadOptions,
     output: OutputOptions,
 ) -> Result<()> {
@@ -397,7 +478,6 @@ fn run_pipeline(
         quiet,
         no_progress,
         json,
-        refresh,
     } = output;
     let outcomes_path = inspection
         .0
@@ -421,10 +501,9 @@ fn run_pipeline(
                 queue,
                 layout,
                 client,
-                metadata_url,
+                metadata_options,
                 packages,
                 inspection,
-                refresh,
             )
         },
         |progress| {
@@ -547,67 +626,129 @@ fn inspect_stream(
     queue: &mut snatchrs::download::DownloadQueue,
     layout: &MirrorLayout,
     client: &IndexClient,
-    metadata_url: Url,
+    metadata_options: MetadataOptions,
     packages: Vec<Package>,
     inspection: (CheckReport, InspectionJournal),
-    refresh: bool,
 ) -> Result<CheckReport> {
     let (mut report, mut journal) = inspection;
     let total = packages.len();
     queue.discovery(discovery(&report, total, 0, ""))?;
-    for (position, package) in packages.into_iter().enumerate() {
-        let name = package.normalized_name.clone();
-        queue.discovery(discovery(&report, total, position, &name))?;
-        let result = client.load_metadata(package, metadata_url.clone(), layout, refresh);
-        let mut stop = false;
-        match result {
-            Ok(MetadataOutcome::Available(metadata)) => {
-                let checked = check_package(
-                    &layout.root,
-                    *metadata,
-                    &mut report.summary,
-                    &mut report.queue_stub,
-                );
-                let tasks = snatchrs::download::build_tasks(std::slice::from_ref(&checked));
-                append_jsonl(&mut journal.packages, &checked)?;
-                let queued = tasks.and_then(|tasks| {
-                    for task in tasks {
-                        queue.enqueue(task)?;
+    let mut completed = 0;
+    parallel_metadata(
+        packages,
+        client,
+        layout,
+        &metadata_options,
+        |name, result| {
+            let mut stop = false;
+            match result {
+                Ok(MetadataOutcome::Available(metadata)) => {
+                    let checked = check_package(
+                        &layout.root,
+                        *metadata,
+                        &mut report.summary,
+                        &mut report.queue_stub,
+                    );
+                    let tasks = snatchrs::download::build_tasks(std::slice::from_ref(&checked));
+                    append_jsonl(&mut journal.packages, &checked)?;
+                    let queued = tasks.and_then(|tasks| {
+                        for task in tasks {
+                            queue.enqueue(task)?;
+                        }
+                        Ok(())
+                    });
+                    if let Err(error) = queued {
+                        record_error(
+                            &mut report,
+                            &mut journal,
+                            PackageError {
+                                name: name.clone(),
+                                error: format!("Failed to queue downloads: {error:#}"),
+                            },
+                        )?;
+                        stop = true;
                     }
-                    Ok(())
-                });
-                if let Err(error) = queued {
-                    record_error(
-                        &mut report,
-                        &mut journal,
-                        PackageError {
-                            name: name.clone(),
-                            error: format!("Failed to queue downloads: {error:#}"),
-                        },
-                    )?;
-                    stop = true;
                 }
+                Ok(MetadataOutcome::NotFound { metadata_url }) => {
+                    record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
+                }
+                Err(error) => record_error(
+                    &mut report,
+                    &mut journal,
+                    PackageError {
+                        name: name.clone(),
+                        error: format!("{error:#}"),
+                    },
+                )?,
             }
-            Ok(MetadataOutcome::NotFound { metadata_url }) => {
-                record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
-            }
-            Err(error) => record_error(
-                &mut report,
-                &mut journal,
-                PackageError {
-                    name: name.clone(),
-                    error: format!("{error:#}"),
-                },
-            )?,
-        }
-        queue.discovery(discovery(&report, total, position + 1, &name))?;
-        if stop {
-            break;
-        }
-    }
+            completed += 1;
+            queue.discovery(discovery(&report, total, completed, &name))?;
+            Ok(!stop)
+        },
+    )?;
     journal.packages.get_ref().sync_all()?;
     journal.errors.get_ref().sync_all()?;
     journal.unavailable.get_ref().sync_all()?;
     write_json(&layout.root.join("check-report.json"), &report)?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_consumer_stop_or_error_releases_blocked_workers() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = MirrorLayout::create(root.path()).unwrap();
+        let source: Url = "http://127.0.0.1:1/simple/fixture/".parse().unwrap();
+        let package = Package {
+            name: "fixture".into(),
+            normalized_name: "fixture".into(),
+            index_url: source.clone(),
+            last_serial: Some(1),
+        };
+        let mut cached = snatchrs::mirror::PackageMetadata::from_reader(
+            br#"{"name":"fixture","meta":{"api-version":"1.4","_last-serial":1},"versions":[],"files":[]}"#.as_slice(),
+            package.clone(), source.clone(), &layout,
+        ).unwrap();
+        cached.metadata_source_url = Some(source);
+        layout.save_metadata(&cached).unwrap();
+        let client = IndexClient::with_attempts(1).unwrap();
+        let options = MetadataOptions {
+            base: "http://127.0.0.1:1/simple/".parse().unwrap(),
+            refresh: false,
+            concurrency: 2,
+        };
+        for fail in [false, true] {
+            let mut consumed = 0;
+            let result = parallel_metadata(
+                vec![package.clone(); 100],
+                &client,
+                &layout,
+                &options,
+                |_, metadata| {
+                    assert!(matches!(metadata?, MetadataOutcome::Available(_)));
+                    consumed += 1;
+                    // Let both workers fill the bounded channel and block on send.
+                    thread::sleep(Duration::from_millis(30));
+                    if fail {
+                        anyhow::bail!("simulated journal failure");
+                    }
+                    Ok(false)
+                },
+            );
+            assert_eq!(consumed, 1);
+            if fail {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("simulated journal failure")
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
 }
