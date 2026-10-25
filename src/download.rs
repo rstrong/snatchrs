@@ -284,7 +284,16 @@ impl DownloadQueue {
             .context("Progress receiver closed")
     }
 
-    pub fn enqueue(&mut self, task: DownloadTask) -> Result<()> {
+    pub fn enqueue(&mut self, mut task: DownloadTask) -> Result<()> {
+        // Accept existing batch callers' absolute paths under this mirror, but
+        // persist and report only paths relative to its root.
+        if task.local_path.is_absolute() {
+            task.local_path = task
+                .local_path
+                .strip_prefix(&self.root)
+                .context("Download path escapes mirror root")?
+                .to_path_buf();
+        }
         // Retain only path + fingerprint for deduplication, not another full
         // in-memory copy of every pending task already written to the spool.
         let fingerprint: [u8; 32] = Sha256::digest(serde_json::to_vec(&(
@@ -320,10 +329,8 @@ impl Drop for DownloadQueue {
 }
 
 fn validate_path(root: &Path, task: &DownloadTask) -> Result<()> {
-    let parent = task
-        .local_path
-        .parent()
-        .context("Download path has no parent")?;
+    let path = crate::mirror::resolve_path(root, &task.local_path)?;
+    let parent = path.parent().context("Download path has no parent")?;
     ensure!(
         parent.canonicalize()?.starts_with(root),
         "Download path escapes mirror root"
@@ -499,7 +506,7 @@ fn stream_with_workers<T: Send>(
                         }
                         let result =
                             reserve_space(root, budget, task.size).and_then(|_reservation| {
-                                download_one(client, &task, |bytes| {
+                                download_one(client, root, &task, |bytes| {
                                     let _ = events.send(Event::Bytes { worker, bytes });
                                 })
                             });
@@ -640,17 +647,21 @@ fn stream_with_workers<T: Send>(
     ))
 }
 
-fn download_one(client: &Client, task: &DownloadTask, mut progress: impl FnMut(u64)) -> Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(&task.local_path) {
+fn download_one(
+    client: &Client,
+    root: &Path,
+    task: &DownloadTask,
+    mut progress: impl FnMut(u64),
+) -> Result<()> {
+    validate_path(root, task)?;
+    let path = crate::mirror::resolve_path(root, &task.local_path)?;
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
         ensure!(
             metadata.file_type().is_file(),
             "Refusing to replace a non-file path"
         );
     }
-    let parent = task
-        .local_path
-        .parent()
-        .context("Missing download parent")?;
+    let parent = path.parent().context("Missing download parent")?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".snatchrs-")
         .tempfile_in(parent)?;
@@ -710,9 +721,7 @@ fn download_one(client: &Client, task: &DownloadTask, mut progress: impl FnMut(u
                 .as_file()
                 .set_permissions(fs::Permissions::from_mode(0o644))?;
         }
-        temporary
-            .persist(&task.local_path)
-            .map_err(|error| error.error)?;
+        temporary.persist(&path).map_err(|error| error.error)?;
         Ok(())
     })();
     if unreported > 0 {
@@ -722,7 +731,7 @@ fn download_one(client: &Client, task: &DownloadTask, mut progress: impl FnMut(u
 }
 
 /// Refresh the final file checks after publication, preserving the selection.
-pub fn final_summary(packages: &[CheckedPackage]) -> crate::mirror::CheckSummary {
+pub fn final_summary(root: &Path, packages: &[CheckedPackage]) -> crate::mirror::CheckSummary {
     let mut summary = crate::mirror::CheckSummary::default();
     for package in packages {
         summary.packages += 1;
@@ -735,7 +744,7 @@ pub fn final_summary(packages: &[CheckedPackage]) -> crate::mirror::CheckSummary
         {
             summary.files += 1;
             summary.expected_bytes += file.size;
-            match crate::mirror::inspect_file(file) {
+            match crate::mirror::inspect_file(root, file) {
                 FileState::Missing => summary.missing += 1,
                 FileState::SizeMismatch { .. } => summary.size_mismatch += 1,
                 FileState::MatchingSize => summary.matching_size += 1,

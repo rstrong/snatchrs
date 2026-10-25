@@ -45,7 +45,7 @@ def main():
     thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="snatchrs-smoke-", dir=args.temp_root) as directory:
-            root = Path(directory)
+            root = Path(directory) / "original"
             common = ["--mirror", str(root), "--package", "remote-smoke", "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/", "--json"]
 
             def run(command, *extra):
@@ -69,6 +69,11 @@ def main():
             repeat = run("mirror", "--concurrency", "2")
             assert repeat["downloads"]["progress"]["downloaded"] == 0
             assert repeat["final_check"]["matching_size"] == 2
+            moved = Path(directory) / "moved"
+            root.rename(moved)
+            root = moved
+            common[1] = str(root)
+            # Verify the saved report before any command can replace it.
             verification = subprocess.run([
                 sys.executable, str(Path(__file__).with_name("verify-mirror.py")), str(root)
             ], capture_output=True, text=True, timeout=30)
@@ -78,6 +83,10 @@ def main():
             assert verified["metadata_packages"] == 1
             assert verified["checked_files"] == 2
             assert verified["sha256_verified_files"] == 2
+            relocated = run("mirror", "--concurrency", "2")
+            assert relocated["downloads"]["progress"]["downloaded"] == 0
+            assert relocated["final_check"]["matching_size"] == 2
+            assert not (Path(directory) / "original").exists()
             # Prove the deployed CLI accepts large sample counts without making
             # any PyPI requests: this local index contains one fixture project.
             result = subprocess.run([
@@ -91,7 +100,7 @@ def main():
             assert len(large["inspection"]["selected_packages"]) == 1
             assert large["downloads"]["progress"]["downloaded"] == 0
             assert sum(path.lstrip("/") in bodies for path in requests) == 2
-            print("PASS: missing/mismatch checks, concurrent downloads, integrity, saved reports, repeat-run skipping, and --sample 10000")
+            print("PASS: missing/mismatch checks, concurrent downloads, integrity, saved reports, mirror relocation, repeat-run skipping, and --sample 10000")
     finally:
         server.shutdown()
         server.server_close()

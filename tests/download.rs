@@ -411,15 +411,23 @@ fn mirror_respects_samples_above_one_hundred_and_smaller_indexes() {
         assert_eq!(report["downloads"]["progress"]["failed"], 0);
         assert!(report["inspection"].get("packages").is_none());
         assert!(report["downloads"].get("outcomes").is_none());
-        let checked =
-            fs::read_to_string(report["inspection"]["packages_path"].as_str().unwrap()).unwrap();
+        let checked = fs::read_to_string(
+            directory
+                .path()
+                .join(report["inspection"]["packages_path"].as_str().unwrap()),
+        )
+        .unwrap();
         assert_eq!(checked.lines().count(), expected);
         for line in checked.lines() {
             let package: snatchrs::mirror::CheckedPackage = serde_json::from_str(line).unwrap();
             assert_eq!(package.files.len(), 1);
         }
-        let outcomes =
-            fs::read_to_string(report["downloads"]["outcomes_path"].as_str().unwrap()).unwrap();
+        let outcomes = fs::read_to_string(
+            directory
+                .path()
+                .join(report["downloads"]["outcomes_path"].as_str().unwrap()),
+        )
+        .unwrap();
         assert_eq!(outcomes.lines().count(), downloaded as usize);
         for line in outcomes.lines() {
             let outcome: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -693,6 +701,7 @@ fn streamed_outcomes_are_not_retained_and_sink_errors_drain_workers() {
             |_| {},
             |outcome| {
                 recorded += 1;
+                assert!(!outcome.task.local_path.is_absolute());
                 assert!(outcome.downloaded);
                 assert!(outcome.sha256_verified);
                 if fail_sink {
@@ -719,4 +728,37 @@ fn streamed_outcomes_are_not_retained_and_sink_errors_drain_workers() {
             assert!(report.outcomes.is_empty());
         }
     }
+}
+
+#[test]
+fn relative_download_paths_reject_parent_traversal_and_symlink_escape() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    for path in ["../escape.whl", "nested/../../escape.whl", ""] {
+        let mut item = task(root.path(), "http://127.0.0.1:1", "escape.whl", b"x");
+        item.local_path = path.into();
+        let result = snatchrs::download::download_stream_to(
+            root.path(),
+            options(1, 1),
+            |queue| queue.enqueue(item),
+            |_| {},
+            |_| Ok(()),
+        );
+        assert!(result.is_err(), "accepted {path}");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
+        let mut item = task(root.path(), "http://127.0.0.1:1", "escape.whl", b"x");
+        item.local_path = "linked/escape.whl".into();
+        let result = snatchrs::download::download_stream_to(
+            root.path(),
+            options(1, 1),
+            |queue| queue.enqueue(item),
+            |_| {},
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+    }
+    assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
 }

@@ -53,17 +53,20 @@ fn includes_all_versions_files_urls_sizes_and_paths() {
     );
     assert_eq!(
         file.local_path,
-        layout
-            .root
-            .join("packages/example-pkg/example_pkg-1.0-py3-none-any.whl")
+        std::path::Path::new("packages/example-pkg/example_pkg-1.0-py3-none-any.whl")
     );
     assert_eq!(file.sha256.as_deref(), Some("abc123"));
     assert_eq!(file.requires_python.as_deref(), Some(">=3.9"));
     assert!(metadata.releases[2].files[0].yanked);
     layout.save_metadata(&metadata).unwrap();
-    assert!(metadata.package_path.is_dir());
-    assert!(metadata.metadata_path.is_file());
-    assert_eq!(fs::read_dir(&metadata.package_path).unwrap().count(), 0);
+    assert!(layout.root.join(&metadata.package_path).is_dir());
+    assert!(layout.root.join(&metadata.metadata_path).is_file());
+    assert_eq!(
+        fs::read_dir(layout.root.join(&metadata.package_path))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -278,12 +281,20 @@ fn checks_missing_matching_wrong_sizes_and_non_files_without_downloading() {
     let layout = MirrorLayout::create(directory.path()).unwrap();
     let metadata = parse(FIXTURE, &layout).unwrap();
     layout.save_metadata(&metadata).unwrap();
-    fs::write(&metadata.releases[1].files[0].local_path, b"1234").unwrap();
-    fs::write(&metadata.releases[1].files[1].local_path, b"x").unwrap();
-    fs::create_dir(&metadata.releases[2].files[1].local_path).unwrap();
+    fs::write(
+        layout.root.join(&metadata.releases[1].files[0].local_path),
+        b"1234",
+    )
+    .unwrap();
+    fs::write(
+        layout.root.join(&metadata.releases[1].files[1].local_path),
+        b"x",
+    )
+    .unwrap();
+    fs::create_dir(layout.root.join(&metadata.releases[2].files[1].local_path)).unwrap();
     let mut summary = CheckSummary::default();
     let mut queue = DownloadQueueStub::default();
-    let checked = check_package(metadata, &mut summary, &mut queue);
+    let checked = check_package(&layout.root, metadata, &mut summary, &mut queue);
     assert_eq!(checked.files[0].state, FileState::MatchingSize);
     assert_eq!(
         checked.files[1].state,
@@ -310,8 +321,11 @@ fn checks_missing_matching_wrong_sizes_and_non_files_without_downloading() {
         (1, 1, 1, 1)
     );
     assert_eq!(queue.candidates_seen, 2);
-    assert!(!checked.files[2].local_path.exists());
-    assert_eq!(fs::read(&checked.files[1].local_path).unwrap(), b"x");
+    assert!(!layout.root.join(&checked.files[2].local_path).exists());
+    assert_eq!(
+        fs::read(layout.root.join(&checked.files[1].local_path)).unwrap(),
+        b"x"
+    );
 }
 
 #[test]
@@ -321,8 +335,8 @@ fn existing_zero_byte_file_matches_zero_expected_size() {
     let metadata = parse(FIXTURE, &layout).unwrap();
     layout.save_metadata(&metadata).unwrap();
     let file = &metadata.releases[2].files[1];
-    fs::write(&file.local_path, b"").unwrap();
-    assert_eq!(inspect_file(file), FileState::MatchingSize);
+    fs::write(layout.root.join(&file.local_path), b"").unwrap();
+    assert_eq!(inspect_file(&layout.root, file), FileState::MatchingSize);
 }
 
 #[test]
@@ -367,13 +381,17 @@ fn rejects_symlink_directories_and_does_not_follow_file_symlinks() {
     let layout = MirrorLayout::create(directory.path()).unwrap();
     let metadata = parse(FIXTURE, &layout).unwrap();
     let outside = tempdir().unwrap();
-    symlink(outside.path(), &metadata.package_path).unwrap();
+    symlink(outside.path(), layout.root.join(&metadata.package_path)).unwrap();
     assert!(layout.save_metadata(&metadata).is_err());
-    fs::remove_file(&metadata.package_path).unwrap();
+    fs::remove_file(layout.root.join(&metadata.package_path)).unwrap();
     layout.save_metadata(&metadata).unwrap();
     let file = &metadata.releases[1].files[0];
-    symlink(outside.path().join("missing"), &file.local_path).unwrap();
-    assert_eq!(inspect_file(file), FileState::NotRegularFile);
+    symlink(
+        outside.path().join("missing"),
+        layout.root.join(&file.local_path),
+    )
+    .unwrap();
+    assert_eq!(inspect_file(&layout.root, file), FileState::NotRegularFile);
 }
 
 #[test]
@@ -470,15 +488,30 @@ fn cli_saves_metadata_and_report_and_continues_after_unavailable_project() {
     assert_eq!(report["error_count"], 0);
     assert_eq!(report["unavailable_count"], 1);
     assert!(report.get("packages").is_none());
-    let errors = fs::read_to_string(report["errors_path"].as_str().unwrap()).unwrap();
+    let errors = fs::read_to_string(
+        directory
+            .path()
+            .join(report["errors_path"].as_str().unwrap()),
+    )
+    .unwrap();
     assert!(errors.is_empty());
-    let unavailable = fs::read_to_string(report["unavailable_path"].as_str().unwrap()).unwrap();
+    let unavailable = fs::read_to_string(
+        directory
+            .path()
+            .join(report["unavailable_path"].as_str().unwrap()),
+    )
+    .unwrap();
     let outcome: serde_json::Value =
         serde_json::from_str(unavailable.lines().next().unwrap()).unwrap();
     assert_eq!(outcome["name"], "gone");
     assert_eq!(outcome["status"], "not_found");
     assert_eq!(outcome["http_status"], 404);
-    let packages = fs::read_to_string(report["packages_path"].as_str().unwrap()).unwrap();
+    let packages = fs::read_to_string(
+        directory
+            .path()
+            .join(report["packages_path"].as_str().unwrap()),
+    )
+    .unwrap();
     let checked: snatchrs::mirror::CheckedPackage =
         serde_json::from_str(packages.lines().next().unwrap()).unwrap();
     assert_eq!(checked.files.len(), 4);

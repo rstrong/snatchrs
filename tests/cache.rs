@@ -332,16 +332,26 @@ fn project_404_is_an_outcome_and_invalidates_only_metadata_cache() {
         assert_eq!(inspection["unavailable_count"], 1);
         assert_eq!(inspection["summary"]["packages"], 0);
         assert!(
-            fs::read_to_string(inspection["errors_path"].as_str().unwrap())
-                .unwrap()
-                .is_empty()
+            fs::read_to_string(
+                root.path()
+                    .join(inspection["errors_path"].as_str().unwrap())
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(
-            fs::read_to_string(inspection["packages_path"].as_str().unwrap())
-                .unwrap()
-                .is_empty()
+            fs::read_to_string(
+                root.path()
+                    .join(inspection["packages_path"].as_str().unwrap())
+            )
+            .unwrap()
+            .is_empty()
         );
-        let records = fs::read_to_string(inspection["unavailable_path"].as_str().unwrap()).unwrap();
+        let records = fs::read_to_string(
+            root.path()
+                .join(inspection["unavailable_path"].as_str().unwrap()),
+        )
+        .unwrap();
         assert_eq!(records.lines().count(), 1);
         let record: serde_json::Value =
             serde_json::from_str(records.lines().next().unwrap()).unwrap();
@@ -412,4 +422,97 @@ fn other_metadata_errors_and_non_project_404s_still_fail() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("404"));
     assert!(output.stdout.is_empty());
     assert_eq!(server.requests(), before);
+}
+
+fn assert_relative_paths(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if key.ends_with("_path") || key == "mirror_root" {
+                    let path = Path::new(value.as_str().unwrap());
+                    assert!(!path.is_absolute(), "{key}: {path:?}");
+                    assert!(
+                        !path
+                            .components()
+                            .any(|part| matches!(part, std::path::Component::ParentDir))
+                    );
+                }
+                assert_relative_paths(value);
+            }
+        }
+        serde_json::Value::Array(values) => values.iter().for_each(assert_relative_paths),
+        _ => {}
+    }
+}
+
+#[test]
+fn moving_a_mirror_preserves_reports_cache_hits_and_download_repairs() {
+    let server = Server::start();
+    let parent = tempdir().unwrap();
+    let original_root = parent.path().join("original");
+    let moved_root = parent.path().join("moved");
+    let report = server.run(&original_root, "mirror", &[], 1);
+    assert_eq!(report["inspection"]["mirror_root"], ".");
+    assert_relative_paths(&report);
+    fs::rename(&original_root, &moved_root).unwrap();
+    // The earlier summary and JSONL links remain valid without rewriting them.
+    for field in ["packages_path", "errors_path", "unavailable_path"] {
+        assert!(
+            moved_root
+                .join(report["inspection"][field].as_str().unwrap())
+                .is_file()
+        );
+    }
+    let packages = fs::read_to_string(
+        moved_root.join(report["inspection"]["packages_path"].as_str().unwrap()),
+    )
+    .unwrap();
+    assert_relative_paths(&serde_json::from_str(packages.lines().next().unwrap()).unwrap());
+    let outcomes =
+        fs::read_to_string(moved_root.join(report["downloads"]["outcomes_path"].as_str().unwrap()))
+            .unwrap();
+    let outcome: serde_json::Value =
+        serde_json::from_str(outcomes.lines().next().unwrap()).unwrap();
+    assert_relative_paths(&outcome);
+    assert_eq!(
+        outcome["task"]["local_path"],
+        "packages/cache-fixture/cache_fixture-1.0.tar.gz"
+    );
+    let cached = moved_root.join("metadata/cache-fixture.json");
+    let cache_bytes = fs::read(&cached).unwrap();
+    assert_relative_paths(&serde_json::from_slice(&cache_bytes).unwrap());
+    let report = server.run(&moved_root, "mirror", &[], 0);
+    assert_eq!(report["final_check"]["matching_size"], 1);
+    assert_eq!(report["downloads"]["progress"]["downloaded"], 0);
+    assert_eq!(fs::read(&cached).unwrap(), cache_bytes);
+    fs::remove_file(moved_root.join("packages/cache-fixture/cache_fixture-1.0.tar.gz")).unwrap();
+    let report = server.run(&moved_root, "mirror", &[], 0);
+    assert_eq!(report["downloads"]["progress"]["downloaded"], 1);
+    assert_eq!(report["final_check"]["matching_size"], 1);
+    assert!(!original_root.exists());
+
+    // Old absolute-path caches are refreshed, never used to write into the old
+    // location, and existing distributions in the current mirror are retained.
+    let mut legacy: serde_json::Value = serde_json::from_slice(&cache_bytes).unwrap();
+    for field in ["metadata_path", "package_path"] {
+        legacy[field] = original_root
+            .join(legacy[field].as_str().unwrap())
+            .to_str()
+            .unwrap()
+            .into();
+    }
+    for release in legacy["releases"].as_array_mut().unwrap() {
+        for file in release["files"].as_array_mut().unwrap() {
+            file["local_path"] = original_root
+                .join(file["local_path"].as_str().unwrap())
+                .to_str()
+                .unwrap()
+                .into();
+        }
+    }
+    fs::write(&cached, legacy.to_string()).unwrap();
+    let report = server.run(&moved_root, "mirror", &[], 1);
+    assert_eq!(report["downloads"]["progress"]["downloaded"], 0);
+    assert_relative_paths(&serde_json::from_slice(&fs::read(cached).unwrap()).unwrap());
+    assert!(!original_root.exists());
 }

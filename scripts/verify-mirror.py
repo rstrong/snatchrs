@@ -13,18 +13,28 @@ def main():
     args = parser.parse_args()
     root = args.mirror.resolve()
     report = json.loads((root / "mirror-report.json").read_text())
+
+    def mirror_path(value):
+        relative = Path(value)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"not a mirror-relative path: {value}")
+        path = root / relative
+        if not path.resolve().is_relative_to(root):
+            raise ValueError(f"path escapes the mirror: {value}")
+        return path
+
     checked = {}
     failures = []
     verified_bytes = 0
     hashed = 0
     metadata_packages = 0
-    with Path(report["inspection"]["packages_path"]).open() as journal:
+    with mirror_path(report["inspection"]["packages_path"]).open() as journal:
         packages = map(json.loads, journal)
         for package in packages:
             metadata_packages += 1
             for release in package["metadata"]["releases"]:
                 for file in release["files"]:
-                    path = Path(file["local_path"])
+                    path = mirror_path(file["local_path"])
                     if path in checked:
                         continue
                     checked[path] = True
@@ -41,12 +51,12 @@ def main():
                             hashed += 1
                         verified_bytes += file["size"]
                     except (OSError, ValueError) as error:
-                        failures.append({"path": str(path), "error": str(error)})
+                        failures.append({"path": file["local_path"], "error": str(error)})
     result = {
         "selected_names": len(report["inspection"]["selected_packages"]),
         "metadata_packages": metadata_packages,
         "unavailable_projects": report["inspection"].get("unavailable_count", 0),
-        "metadata_errors": [json.loads(line) for line in Path(report["inspection"]["errors_path"]).read_text().splitlines()],
+        "metadata_errors": [json.loads(line) for line in mirror_path(report["inspection"]["errors_path"]).read_text().splitlines()],
         "checked_files": len(checked), "sha256_verified_files": hashed,
         "verified_bytes": verified_bytes, "failures": failures,
         "download_failures": report["downloads"]["progress"]["failed"],

@@ -132,7 +132,17 @@ mirror-shell/
   check-report.json                    # latest run summary and detail-file paths
 ```
 
-Paths stored in the metadata and report are absolute paths under the mirror root.
+All filesystem paths stored in metadata, reports, JSONL details, and download
+outcomes are relative to the mirror root, such as
+`packages/packaging/packaging-25.0.tar.gz` or `reports/run-*/checked-packages.jsonl`.
+Resolve them against the directory passed to `--mirror`, rather than the working
+directory or the JSON file's own directory. Reports use `mirror_root: "."`.
+Moving or copying the whole mirror preserves cached metadata, report links, and
+repeat-run file checks. Download URLs remain absolute HTTP/HTTPS URLs.
+
+Legacy metadata caches containing absolute paths are fetched again when selected
+and replaced with relative paths; existing distribution files are still checked
+and reused. Historical reports from older versions are not rewritten.
 `PackageMetadata` contains the package, metadata URL, metadata file path, package
 directory, last serial, and every release version. `Release` contains all its
 distribution files (all wheels and source distributions, including yanked files).

@@ -256,7 +256,8 @@ fn check_cli_attempt_budget_applies_to_metadata_and_is_exhausted() {
     assert_eq!(server.count(), 2);
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["error_count"], 1);
-    let errors = fs::read_to_string(report["errors_path"].as_str().unwrap()).unwrap();
+    let errors =
+        fs::read_to_string(root.path().join(report["errors_path"].as_str().unwrap())).unwrap();
     let error: serde_json::Value = serde_json::from_str(errors.lines().next().unwrap()).unwrap();
     assert!(error["error"].as_str().unwrap().contains("2 attempt(s)"));
 }

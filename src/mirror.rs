@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{BufReader, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -100,9 +100,7 @@ impl PackageMetadata {
             });
         }
         Ok(Self {
-            metadata_path: layout
-                .root
-                .join("metadata")
+            metadata_path: PathBuf::from("metadata")
                 .join(format!("{}.json", package.normalized_name)),
             package_path,
             package,
@@ -230,7 +228,7 @@ impl MirrorLayout {
     }
 
     pub fn package_path(&self, name: &str) -> Result<PathBuf> {
-        Ok(self.root.join("packages").join(normalize_name(name)?))
+        Ok(PathBuf::from("packages").join(normalize_name(name)?))
     }
 
     fn cached_metadata(&self, package: &Package, source: &Url) -> Option<PackageMetadata> {
@@ -249,7 +247,8 @@ impl MirrorLayout {
             || metadata.package.normalized_name != package.normalized_name
             || normalize_name(&metadata.package.name).ok().as_ref()
                 != Some(&package.normalized_name)
-            || metadata.metadata_path != path
+            || metadata.metadata_path
+                != PathBuf::from("metadata").join(format!("{}.json", package.normalized_name))
             || metadata.package_path != package_path
             || !matches!(metadata.metadata_url.scheme(), "http" | "https")
         {
@@ -264,7 +263,7 @@ impl MirrorLayout {
             }
         }
         // Retain the normal directory/symlink checks even on a cache hit.
-        create_directory(&package_path).ok()?;
+        create_directory(&self.root.join(&package_path)).ok()?;
         Some(metadata)
     }
 
@@ -281,9 +280,25 @@ impl MirrorLayout {
     }
 
     pub fn save_metadata(&self, metadata: &PackageMetadata) -> Result<()> {
-        create_directory(&metadata.package_path)?;
-        write_json(&metadata.metadata_path, metadata)
+        let package_path = resolve_path(&self.root, &metadata.package_path)?;
+        let metadata_path = resolve_path(&self.root, &metadata.metadata_path)?;
+        create_directory(&package_path)?;
+        write_json(&metadata_path, metadata)
     }
+}
+
+/// Resolve a stored path under the selected mirror, rejecting absolute paths
+/// and parent traversal. Filesystem symlink checks belong at each I/O boundary.
+pub fn resolve_path(root: &Path, relative: &Path) -> Result<PathBuf> {
+    ensure!(
+        !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_))),
+        "Expected a path relative to the mirror root: {}",
+        relative.display()
+    );
+    Ok(root.join(relative))
 }
 
 fn create_directory(path: &Path) -> Result<()> {
@@ -332,8 +347,16 @@ impl FileState {
     }
 }
 
-pub fn inspect_file(file: &DistributionFile) -> FileState {
-    match fs::symlink_metadata(&file.local_path) {
+pub fn inspect_file(root: &Path, file: &DistributionFile) -> FileState {
+    let path = match resolve_path(root, &file.local_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return FileState::Error {
+                message: error.to_string(),
+            };
+        }
+    };
+    match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => FileState::NotRegularFile,
         Ok(metadata) if metadata.len() != file.size => FileState::SizeMismatch {
             actual_size: metadata.len(),
@@ -388,6 +411,7 @@ impl DownloadQueueStub {
 }
 
 pub fn check_package(
+    root: &Path,
     metadata: PackageMetadata,
     summary: &mut CheckSummary,
     queue: &mut DownloadQueueStub,
@@ -397,7 +421,7 @@ pub fn check_package(
     let mut files = Vec::new();
     for release in &metadata.releases {
         for file in &release.files {
-            let state = inspect_file(file);
+            let state = inspect_file(root, file);
             summary.files += 1;
             summary.expected_bytes += file.size;
             match &state {

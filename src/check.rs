@@ -200,16 +200,17 @@ fn run_inner(
         .prefix("run-")
         .tempdir_in(reports)?
         .keep();
+    let run_dir = run_dir.strip_prefix(&layout.root)?.to_path_buf();
     let packages_path = run_dir.join("checked-packages.jsonl");
     let errors_path = run_dir.join("package-errors.jsonl");
     let unavailable_path = run_dir.join("unavailable-projects.jsonl");
     let mut journal = InspectionJournal {
-        packages: BufWriter::new(File::create(&packages_path)?),
-        errors: BufWriter::new(File::create(&errors_path)?),
-        unavailable: BufWriter::new(File::create(&unavailable_path)?),
+        packages: BufWriter::new(File::create(layout.root.join(&packages_path))?),
+        errors: BufWriter::new(File::create(layout.root.join(&errors_path))?),
+        unavailable: BufWriter::new(File::create(layout.root.join(&unavailable_path))?),
     };
     let mut report = CheckReport {
-        mirror_root: layout.root.clone(),
+        mirror_root: PathBuf::from("."),
         seed,
         selected_packages: packages
             .iter()
@@ -257,7 +258,12 @@ fn run_inner(
         let result = client.load_metadata(package, metadata_url.clone(), &layout, args.refresh);
         match result {
             Ok(MetadataOutcome::Available(metadata)) => {
-                let checked = check_package(*metadata, &mut report.summary, &mut report.queue_stub);
+                let checked = check_package(
+                    &layout.root,
+                    *metadata,
+                    &mut report.summary,
+                    &mut report.queue_stub,
+                );
                 append_jsonl(&mut journal.packages, &checked)?;
             }
             Ok(MetadataOutcome::NotFound { metadata_url }) => {
@@ -303,7 +309,7 @@ fn run_inner(
         serde_json::to_writer_pretty(&mut stdout, &report)?;
         writeln!(stdout)?;
     } else if !interactive {
-        visit_packages(&report.packages_path, |package| {
+        visit_packages(&layout.root.join(&report.packages_path), |package| {
             let missing = package
                 .files
                 .iter()
@@ -399,7 +405,7 @@ fn run_pipeline(
         .parent()
         .context("Missing run directory")?
         .join("download-outcomes.jsonl");
-    let mut outcomes_file = BufWriter::new(File::create(&outcomes_path)?);
+    let mut outcomes_file = BufWriter::new(File::create(layout.root.join(&outcomes_path))?);
     let mut ui = crate::interactive(quiet, no_progress, json)
         .then(|| crate::download_ui::DownloadDashboard::new(options.concurrency));
     let mut checkpoint = Instant::now()
@@ -456,8 +462,9 @@ fn run_pipeline(
         ui.finish(&downloads.progress);
     }
     let mut final_check = CheckSummary::default();
-    visit_packages(&inspection.packages_path, |package| {
+    visit_packages(&layout.root.join(&inspection.packages_path), |package| {
         check_package(
+            &layout.root,
             package.metadata,
             &mut final_check,
             &mut DownloadQueueStub::default(),
@@ -555,7 +562,12 @@ fn inspect_stream(
         let mut stop = false;
         match result {
             Ok(MetadataOutcome::Available(metadata)) => {
-                let checked = check_package(*metadata, &mut report.summary, &mut report.queue_stub);
+                let checked = check_package(
+                    &layout.root,
+                    *metadata,
+                    &mut report.summary,
+                    &mut report.queue_stub,
+                );
                 let tasks = snatchrs::download::build_tasks(std::slice::from_ref(&checked));
                 append_jsonl(&mut journal.packages, &checked)?;
                 let queued = tasks.and_then(|tasks| {
