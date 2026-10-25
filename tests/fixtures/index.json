@@ -1,0 +1,8 @@
+{
+  "meta": {"api-version": "1.4", "_last-serial": 12345},
+  "projects": [
+    {"name": "Friendly_Bard", "_last-serial": 123},
+    {"name": "requests"},
+    {"name": "zope.interface", "_last-serial": 456}
+  ]
+}
