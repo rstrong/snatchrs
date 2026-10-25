@@ -17,8 +17,8 @@ use serde::Serialize;
 use snatchrs::{
     DEFAULT_INDEX_URL, IndexClient, IndexProgress, Package,
     mirror::{
-        CheckSummary, CheckedPackage, DownloadQueueStub, MetadataOutcome, MirrorLayout,
-        check_package, sample_packages, write_json,
+        CheckSummary, CheckedPackage, MetadataOutcome, MirrorLayout, check_package,
+        sample_packages, write_json,
     },
 };
 use url::Url;
@@ -132,7 +132,6 @@ struct CheckReport {
     seed: Option<u64>,
     selected_packages: Vec<String>,
     summary: CheckSummary,
-    queue_stub: DownloadQueueStub,
     packages_path: PathBuf,
     errors_path: PathBuf,
     error_count: usize,
@@ -299,7 +298,6 @@ fn run_inner(
             .map(|package| package.normalized_name.clone())
             .collect(),
         summary: CheckSummary::default(),
-        queue_stub: DownloadQueueStub::default(),
         packages_path,
         errors_path,
         error_count: 0,
@@ -337,12 +335,7 @@ fn run_inner(
         |name, result| {
             match result {
                 Ok(MetadataOutcome::Available(metadata)) => {
-                    let checked = check_package(
-                        &layout.root,
-                        *metadata,
-                        &mut report.summary,
-                        &mut report.queue_stub,
-                    );
+                    let checked = check_package(&layout.root, *metadata, &mut report.summary);
                     append_jsonl(&mut journal.packages, &checked)?;
                 }
                 Ok(MetadataOutcome::NotFound { metadata_url }) => {
@@ -430,8 +423,8 @@ fn run_inner(
         )?;
         writeln!(
             stdout,
-            "Download queue stub: {} candidates; no downloads performed",
-            report.queue_stub.candidates_seen
+            "{} files need downloading; no downloads performed",
+            report.summary.missing + report.summary.size_mismatch
         )?;
     }
     stdout.flush()?;
@@ -542,12 +535,7 @@ fn run_pipeline(
     }
     let mut final_check = CheckSummary::default();
     visit_packages(&layout.root.join(&inspection.packages_path), |package| {
-        check_package(
-            &layout.root,
-            package.metadata,
-            &mut final_check,
-            &mut DownloadQueueStub::default(),
-        );
+        check_package(&layout.root, package.metadata, &mut final_check);
         Ok(())
     })?;
     let report = MirrorReport {
@@ -643,12 +631,7 @@ fn inspect_stream(
             let mut stop = false;
             match result {
                 Ok(MetadataOutcome::Available(metadata)) => {
-                    let checked = check_package(
-                        &layout.root,
-                        *metadata,
-                        &mut report.summary,
-                        &mut report.queue_stub,
-                    );
+                    let checked = check_package(&layout.root, *metadata, &mut report.summary);
                     let tasks = snatchrs::download::build_tasks(std::slice::from_ref(&checked));
                     append_jsonl(&mut journal.packages, &checked)?;
                     let queued = tasks.and_then(|tasks| {

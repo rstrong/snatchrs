@@ -396,25 +396,10 @@ pub struct CheckSummary {
     pub blocked: usize,
 }
 
-/// Placeholder only: count candidates without storing jobs or downloading files.
-#[derive(Debug, Default, Serialize)]
-pub struct DownloadQueueStub {
-    pub candidates_seen: usize,
-}
-
-impl DownloadQueueStub {
-    pub fn consider(&mut self, _file: &DistributionFile, state: &FileState) {
-        if state.needs_download() {
-            self.candidates_seen += 1;
-        }
-    }
-}
-
 pub fn check_package(
     root: &Path,
     metadata: PackageMetadata,
     summary: &mut CheckSummary,
-    queue: &mut DownloadQueueStub,
 ) -> CheckedPackage {
     summary.packages += 1;
     summary.releases += metadata.releases.len();
@@ -430,7 +415,6 @@ pub fn check_package(
                 FileState::MatchingSize => summary.matching_size += 1,
                 FileState::NotRegularFile | FileState::Error { .. } => summary.blocked += 1,
             }
-            queue.consider(file, &state);
             files.push(CheckedFile {
                 version: release.version.clone(),
                 filename: file.filename.clone(),

@@ -9,8 +9,8 @@ use std::{
 use snatchrs::{
     IndexClient, Package, PackageIndex,
     mirror::{
-        CheckSummary, DownloadQueueStub, FileState, MetadataOutcome, MirrorLayout, PackageMetadata,
-        check_package, inspect_file, sample_packages,
+        CheckSummary, FileState, MetadataOutcome, MirrorLayout, PackageMetadata, check_package,
+        inspect_file, sample_packages,
     },
 };
 use tempfile::tempdir;
@@ -293,8 +293,7 @@ fn checks_missing_matching_wrong_sizes_and_non_files_without_downloading() {
     .unwrap();
     fs::create_dir(layout.root.join(&metadata.releases[2].files[1].local_path)).unwrap();
     let mut summary = CheckSummary::default();
-    let mut queue = DownloadQueueStub::default();
-    let checked = check_package(&layout.root, metadata, &mut summary, &mut queue);
+    let checked = check_package(&layout.root, metadata, &mut summary);
     assert_eq!(checked.files[0].state, FileState::MatchingSize);
     assert_eq!(
         checked.files[1].state,
@@ -320,7 +319,6 @@ fn checks_missing_matching_wrong_sizes_and_non_files_without_downloading() {
         ),
         (1, 1, 1, 1)
     );
-    assert_eq!(queue.candidates_seen, 2);
     assert!(!layout.root.join(&checked.files[2].local_path).exists());
     assert_eq!(
         fs::read(layout.root.join(&checked.files[1].local_path)).unwrap(),
@@ -484,7 +482,7 @@ fn cli_saves_metadata_and_report_and_continues_after_unavailable_project() {
     assert_eq!(report["summary"]["packages"], 1);
     assert_eq!(report["summary"]["releases"], 3);
     assert_eq!(report["summary"]["missing"], 4);
-    assert_eq!(report["queue_stub"]["candidates_seen"], 4);
+    assert!(report.get("queue_stub").is_none());
     assert_eq!(report["error_count"], 0);
     assert_eq!(report["unavailable_count"], 1);
     assert!(report.get("packages").is_none());
@@ -563,7 +561,6 @@ fn cli_saves_metadata_and_report_and_continues_after_unavailable_project() {
     assert_eq!(report["summary"]["matching_size"], 1);
     assert_eq!(report["summary"]["size_mismatch"], 1);
     assert_eq!(report["summary"]["missing"], 2);
-    assert_eq!(report["queue_stub"]["candidates_seen"], 3);
     assert_eq!(
         fs::read(package_path.join("example_pkg-1.0.tar.gz")).unwrap(),
         b"x"

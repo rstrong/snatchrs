@@ -43,7 +43,7 @@ impl Dashboard {
     ) {
         self.bar.set_style(style("{msg}"));
         self.bar.finish_with_message(format!(
-            "Checked {} packages · {} releases · {} files in {:.2}s\n  {} missing · {} size mismatches · {} matching sizes\n  {} blocked files · {errors} package errors · {unavailable} unavailable projects\n  Download queue stub: {} candidates; no downloads performed",
+            "Checked {} packages · {} releases · {} files in {:.2}s\n  {} missing · {} size mismatches · {} matching sizes\n  {} blocked files · {errors} package errors · {unavailable} unavailable projects\n  {} files need downloading; no downloads performed",
             summary.packages, summary.releases, summary.files, elapsed.as_secs_f64(), summary.missing, summary.size_mismatch, summary.matching_size, summary.blocked, summary.missing + summary.size_mismatch,
         ));
     }

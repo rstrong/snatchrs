@@ -217,8 +217,8 @@ File inspection records `missing`, `size_mismatch` (including actual size),
 check; hashes are retained but not verified yet. Existing distributions are never
 modified. Unsafe filenames and symlinked package directories are rejected.
 
-For `check`, `DownloadQueueStub` only counts missing/size-mismatched candidates. It does not
-store jobs, start workers, or download files. Blocked paths are reported separately.
+`check` never downloads files; missing and size-mismatched files are counted in the
+report summary. Blocked paths are reported separately.
 Package failures do not prevent inspection of the remaining selection, and are
 included in the saved report. Package failures or blocked files produce a nonzero
 exit status; ordinary missing/size-mismatched files do not.
