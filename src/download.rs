@@ -2,9 +2,9 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -12,10 +12,10 @@ use std::{
 use crate::mirror::{CheckedPackage, FileState};
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadTask {
     pub package: String,
     pub filename: String,
@@ -152,8 +152,8 @@ enum Event {
     },
 }
 
-// Reservations conservatively cover the full size of queued and active files.
-// They are released even on failed sends, failed downloads, or worker unwinding.
+// Reserve space only for active transfers. Queued metadata must not prevent the
+// checker from advancing, even when a large backlog has accumulated.
 struct Reservation {
     bytes: u64,
     budget: Arc<Mutex<u64>>,
@@ -163,19 +163,111 @@ impl Drop for Reservation {
         *self.budget.lock().unwrap_or_else(|p| p.into_inner()) -= self.bytes;
     }
 }
-struct QueuedTask {
-    task: DownloadTask,
-    _reservation: Reservation,
+fn reserve_space(root: &Path, budget: &Arc<Mutex<u64>>, bytes: u64) -> Result<Reservation> {
+    let mut reserved = budget.lock().unwrap_or_else(|p| p.into_inner());
+    let needed = reserved
+        .checked_add(bytes)
+        .context("Reserved sizes overflow u64")?;
+    ensure!(
+        fs2::available_space(root)? >= needed,
+        "Not enough disk space for {needed} bytes of active downloads"
+    );
+    *reserved = needed;
+    Ok(Reservation {
+        bytes,
+        budget: budget.clone(),
+    })
 }
 
-/// The checker feeds this bounded queue as soon as a package has been inspected.
-/// Sending applies backpressure while workers continue downloading.
+struct DiskQueueState {
+    writer: fs::File,
+    reader: BufReader<fs::File>,
+    pending: usize,
+    closed: bool,
+}
+
+// Pending jobs are JSON lines on disk rather than a fixed-size channel. The
+// mutex covers only local queue I/O; it is never held during a download.
+struct DiskQueue {
+    state: Mutex<DiskQueueState>,
+    ready: Condvar,
+    _spool: tempfile::NamedTempFile,
+}
+
+impl DiskQueue {
+    fn new(root: &Path) -> Result<Self> {
+        let spool = tempfile::Builder::new()
+            .prefix(".snatchrs-queue-")
+            .tempfile_in(root)?;
+        let state = DiskQueueState {
+            // Reopen gives independent read/write offsets; try_clone would share
+            // a file offset and corrupt the queue when used for append + read.
+            writer: spool.reopen()?,
+            reader: BufReader::new(spool.reopen()?),
+            pending: 0,
+            closed: false,
+        };
+        Ok(Self {
+            state: Mutex::new(state),
+            ready: Condvar::new(),
+            _spool: spool,
+        })
+    }
+
+    fn push(&self, task: &DownloadTask, events: &mpsc::SyncSender<Event>) -> Result<()> {
+        let mut record = serde_json::to_vec(task)?;
+        record.push(b'\n');
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        ensure!(!state.closed, "Download queue is closed");
+        state
+            .writer
+            .write_all(&record)
+            .context("Cannot append download queue")?;
+        // Announce before allowing a worker to take the job, so progress totals
+        // always include a file before its Started/Finished events arrive.
+        events
+            .send(Event::Queued { size: task.size })
+            .context("Progress receiver closed")?;
+        state.pending += 1;
+        drop(state);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    fn next(&self) -> Result<Option<DownloadTask>> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if state.pending > 0 {
+                let mut record = String::new();
+                ensure!(
+                    state.reader.read_line(&mut record)? > 0,
+                    "Download queue was truncated"
+                );
+                let task =
+                    serde_json::from_str(&record).context("Invalid download queue record")?;
+                state.pending -= 1;
+                return Ok(Some(task));
+            }
+            if state.closed {
+                return Ok(None);
+            }
+            state = self.ready.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        self.ready.notify_all();
+    }
+}
+
+/// The checker appends pending work to disk and can advance independently of
+/// download speed. Only the configured workers hold active jobs in memory.
 pub struct DownloadQueue {
     root: PathBuf,
-    sender: mpsc::SyncSender<QueuedTask>,
+    jobs: Arc<DiskQueue>,
     events: mpsc::SyncSender<Event>,
-    budget: Arc<Mutex<u64>>,
-    seen: BTreeMap<PathBuf, DownloadTask>,
+    seen: BTreeMap<PathBuf, [u8; 32]>,
     total_bytes: u64,
 }
 impl DownloadQueue {
@@ -186,9 +278,17 @@ impl DownloadQueue {
     }
 
     pub fn enqueue(&mut self, task: DownloadTask) -> Result<()> {
+        // Retain only path + fingerprint for deduplication, not another full
+        // in-memory copy of every pending task already written to the spool.
+        let fingerprint: [u8; 32] = Sha256::digest(serde_json::to_vec(&(
+            task.size,
+            &task.download_url,
+            &task.sha256,
+        ))?)
+        .into();
         if let Some(existing) = self.seen.get(&task.local_path) {
             ensure!(
-                same_file(existing, &task),
+                existing == &fingerprint,
                 "Conflicting metadata for {}",
                 task.local_path.display()
             );
@@ -199,32 +299,16 @@ impl DownloadQueue {
             .total_bytes
             .checked_add(task.size)
             .context("Download sizes overflow u64")?;
-        let mut reserved = self.budget.lock().unwrap_or_else(|p| p.into_inner());
-        let needed = reserved
-            .checked_add(task.size)
-            .context("Reserved sizes overflow u64")?;
-        ensure!(
-            fs2::available_space(&self.root)? >= needed,
-            "Not enough disk space for {needed} bytes of queued and active downloads"
-        );
-        *reserved = needed;
-        drop(reserved);
-        let reservation = Reservation {
-            bytes: task.size,
-            budget: self.budget.clone(),
-        };
-        self.events
-            .send(Event::Queued { size: task.size })
-            .context("Progress receiver closed")?;
-        self.seen.insert(task.local_path.clone(), task.clone());
+        self.jobs.push(&task, &self.events)?;
+        self.seen.insert(task.local_path, fingerprint);
         self.total_bytes = total_bytes;
-        self.sender
-            .send(QueuedTask {
-                task,
-                _reservation: reservation,
-            })
-            .context("Download workers stopped")?;
         Ok(())
+    }
+}
+
+impl Drop for DownloadQueue {
+    fn drop(&mut self) {
+        self.jobs.close();
     }
 }
 
@@ -274,7 +358,7 @@ pub fn download_all(
     Ok(report)
 }
 
-/// Run a producer, bounded download workers, and a responsive progress consumer
+/// Run a producer, fixed download workers, and a responsive progress consumer
 /// concurrently. Closing the producer drains all accepted jobs before returning.
 pub fn download_stream<T: Send>(
     root: &Path,
@@ -325,13 +409,12 @@ fn stream_with_workers<T: Send>(
     };
     progress(&state);
     let (events, receiver) = mpsc::sync_channel(worker_count.max(1) * 2);
-    let (sender, jobs) = mpsc::sync_channel(worker_count.max(1) * 4);
-    let jobs = Arc::new(Mutex::new(jobs));
+    let jobs = Arc::new(DiskQueue::new(&root)?);
+    let budget = Arc::new(Mutex::new(0));
     let queue = DownloadQueue {
-        root,
-        sender,
+        root: root.clone(),
+        jobs: jobs.clone(),
         events: events.clone(),
-        budget: Arc::new(Mutex::new(0)),
         seen: BTreeMap::new(),
         total_bytes: 0,
     };
@@ -344,10 +427,11 @@ fn stream_with_workers<T: Send>(
             let events = events.clone();
             let jobs = jobs.clone();
             let client = &client;
-            handles.push(scope.spawn(move || {
+            let root = &root;
+            let budget = &budget;
+            handles.push(scope.spawn(move || -> Result<()> {
                 loop {
-                    let job = jobs.lock().unwrap_or_else(|p| p.into_inner()).recv();
-                    let Ok(QueuedTask { task, _reservation }) = job else {
+                    let Some(task) = jobs.next()? else {
                         break;
                     };
                     let mut outcome = DownloadOutcome {
@@ -369,11 +453,15 @@ fn stream_with_workers<T: Send>(
                             })
                             .is_err()
                         {
-                            return;
+                            return Ok(());
                         }
-                        match download_one(client, &task, |bytes| {
-                            let _ = events.send(Event::Bytes { worker, bytes });
-                        }) {
+                        let result =
+                            reserve_space(root, budget, task.size).and_then(|_reservation| {
+                                download_one(client, &task, |bytes| {
+                                    let _ = events.send(Event::Bytes { worker, bytes });
+                                })
+                            });
+                        match result {
                             Ok(()) => {
                                 outcome.downloaded = true;
                                 outcome.sha256_verified = task.sha256.is_some();
@@ -393,10 +481,10 @@ fn stream_with_workers<T: Send>(
                         })
                         .is_err()
                     {
-                        return;
+                        return Ok(());
                     }
-                    drop(_reservation);
                 }
+                Ok(())
             }));
         }
         drop(jobs);
@@ -466,7 +554,7 @@ fn stream_with_workers<T: Send>(
         for handle in handles {
             handle
                 .join()
-                .map_err(|_| anyhow::anyhow!("Download worker panicked"))?;
+                .map_err(|_| anyhow::anyhow!("Download worker panicked"))??;
         }
         produced
             .join()

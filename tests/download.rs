@@ -566,7 +566,7 @@ fn streaming_queue_deduplicates_rejects_conflicts_and_drains_after_producer_erro
 }
 
 #[test]
-fn bounded_streaming_queue_applies_backpressure_while_workers_keep_running() {
+fn checking_can_enqueue_every_job_while_download_workers_are_blocked() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let released = Arc::new(AtomicBool::new(false));
@@ -584,7 +584,7 @@ fn bounded_streaming_queue_applies_backpressure_while_workers_keep_running() {
     });
     let directory = tempdir().unwrap();
     let accepted = AtomicUsize::new(0);
-    let mut saw_backpressure = false;
+    let mut checker_finished_before_download = false;
     let (_, report) = snatchrs::download::download_stream(
         directory.path(),
         options(1, 1),
@@ -601,17 +601,50 @@ fn bounded_streaming_queue_applies_backpressure_while_workers_keep_running() {
             Ok(())
         },
         |progress| {
-            if !released.load(Ordering::Acquire) && progress.total_files >= 6 {
-                // One active + four buffered jobs; the sixth enqueue blocks.
-                saw_backpressure =
-                    accepted.load(Ordering::Acquire) <= 5 && !progress.discovery.finished;
+            if !released.load(Ordering::Acquire) && progress.discovery.finished {
+                checker_finished_before_download = accepted.load(Ordering::Acquire) == 20
+                    && progress.downloaded == 0
+                    && progress.total_files == 20;
+                released.store(true, Ordering::Release);
+            } else if progress.elapsed_seconds > 2.0 {
+                // Let a regression finish instead of hanging on its full queue.
                 released.store(true, Ordering::Release);
             }
         },
     )
     .unwrap();
     server.join().unwrap();
-    assert!(saw_backpressure);
+    assert!(
+        checker_finished_before_download,
+        "checking must not wait for a download slot to become free"
+    );
     assert_eq!(report.progress.downloaded, 20);
     assert!(report.progress.discovery.finished);
+}
+
+#[test]
+fn queued_artifact_size_does_not_stop_checking_and_active_space_failures_are_reported() {
+    let directory = tempdir().unwrap();
+    let mut huge = task(directory.path(), "http://127.0.0.1:1", "huge.whl", b"");
+    huge.size = u64::MAX;
+    let (checked, report) = snatchrs::download::download_stream(
+        directory.path(),
+        options(1, 1),
+        |queue| {
+            queue.enqueue(huge)?;
+            Ok("checker continued")
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(checked, "checker continued");
+    assert_eq!(report.progress.failed, 1);
+    assert!(
+        report.outcomes[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Not enough disk space")
+    );
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
 }

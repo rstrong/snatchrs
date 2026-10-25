@@ -15,8 +15,8 @@ using `--json` also selects plain output automatically. `--quiet` suppresses sta
 ```text
 ⠹ snatchrs · Building packages  00:00:08
   ━━━━━━━━━━━━━━━━━━━╸──────────────────────  48%
-  442,939 / 922,790 packages
-  Current: matplotlib
+  480 / 1,000 packages
+  Current: example-project
 ```
 
 ## Run
@@ -72,8 +72,6 @@ It accepts API major version 1 and ignores unknown response fields.
 Malformed names and malformed responses produce errors instead of being skipped.
 The root index supplies discovery data. The `check` command enriches selected
 packages with release and file metadata as described below.
-
-The original `pypi-mirror.py` is preserved as a reference for later mirroring work.
 
 ## Inspect a mirror shell
 
@@ -143,9 +141,9 @@ exit status; ordinary missing/size-mismatched files do not.
 
 ```bash
 cargo build --release --locked
-./target/release/snatchrs mirror --mirror /mirror/pypi --sample 100 --concurrency 8
-./target/release/snatchrs mirror --mirror /mirror/pypi --sample 100 --seed 20261025 -j 4
-./target/release/snatchrs mirror --mirror /mirror/pypi --package packaging --threads 2
+./target/release/snatchrs mirror --mirror ./mirror-shell --sample 100 --concurrency 8
+./target/release/snatchrs mirror --mirror ./mirror-shell --sample 100 --seed 42 -j 4
+./target/release/snatchrs mirror --mirror ./mirror-shell --package packaging --threads 2
 ```
 
 `mirror` defaults to **100 randomly sampled package names**. `--sample` controls
@@ -158,9 +156,12 @@ remaining selected packages are processed, without drawing replacement packages.
 `--concurrency` (`-j`, alias `--threads`) controls simultaneous downloads, from 1
 through 64; the default is 8. Metadata discovery is sequential, and overlaps with
 downloads: each checked package immediately feeds missing/wrong-sized files into
-a bounded queue. Workers start downloading those files while later packages are
-still being fetched and checked. The queue buffers four jobs per worker and
-applies backpressure to the checker when full. `--attempts`
+a disk-backed pending queue. Workers start downloading those files while later
+packages are still being fetched and checked. The checker can keep adding jobs
+even when every download worker is busy; it does not wait for download slots.
+Pending jobs are spooled to a temporary JSON-lines file under the mirror root,
+and workers read them in order. The spool is per-run, not a crash-resumable queue;
+rerunning checks the files again and skips completed downloads. `--attempts`
 controls attempts per file (default 3, maximum 10). Existing files with matching
 sizes are skipped. Missing and wrong-sized files are deduplicated by local path
 and downloaded by a bounded worker pool. Conflicting metadata for one path fails.
@@ -173,10 +174,12 @@ are never installed, imported, or extracted. A failed command can be rerun to sk
 completed files; partial downloads restart from zero. Interrupted processes may
 leave hidden temporary files, which are never treated as completed artifacts.
 
-As jobs are queued, the command conservatively reserves disk space for queued and
-active files, including replacements. Reservations are released as jobs finish.
-A queue/storage failure stops further discovery, drains accepted jobs, and is
-recorded in the final report. Individual metadata failures are recorded and
+Workers check and conservatively reserve disk space for active transfers,
+including replacements. Pending jobs do not reserve their future artifact size
+or block checking while waiting for a worker. Reservations are released after
+each attempt. Transfer/storage failures are recorded per file. A queue-spool
+write failure stops further discovery, drains accepted jobs, and is recorded in
+the final report. Individual metadata failures are recorded and
 discovery continues. A filesystem lock prevents simultaneous
 `check`/`mirror` commands from using the same root. Existing files are checked by
 size only; their hashes are not revalidated on subsequent runs.
@@ -203,7 +206,7 @@ compatible Simple Index is a later step.
 For a 10,000-package download run:
 
 ```bash
-./target/release/snatchrs mirror --mirror /mirror/pypi --sample 10000 --seed 20261025 --concurrency 8
+./target/release/snatchrs mirror --mirror ./mirror-shell --sample 10000 --seed 42 --concurrency 8
 ```
 
 To verify a copied binary without Rust, the standalone smoke test uses Python's
@@ -214,22 +217,21 @@ concurrent downloads, integrity, saved reports, and a second run that skips file
 python3 scripts/remote-smoke.py --binary ./target/release/snatchrs
 # Verify overlapping discovery/downloads and render the combined TUI in a PTY:
 python3 scripts/pipeline-smoke.py --binary ./target/release/snatchrs
+# Verify checking/queueing can finish while every download worker is blocked:
+python3 scripts/pipeline-smoke.py --binary ./target/release/snatchrs --check-ahead
 # Independently re-read and hash a completed mirror's artifacts:
-python3 scripts/verify-mirror.py /mirror/pypi
+python3 scripts/verify-mirror.py ./mirror-shell
 ```
 
-For a persistent remote test, copy the binary to `~/.local/bin/snatchrs`, copy
-`scripts/run-100.sh`, and run it inside tmux:
+For a long-running mirror, run the command inside your terminal multiplexer.
+The optional runner accepts a mirror root followed by any `mirror` options:
 
 ```bash
-tmux new-session -s snatchrs-test 'bash ~/run-100.sh 8'
-# Detach with Ctrl-b, then d. Reattach with:
-tmux attach -t snatchrs-test
+SNATCHRS_BIN=./target/release/snatchrs bash scripts/run-mirror.sh ./mirror-shell --sample 10000 --concurrency 8
 ```
 
-The script uses `/mirror/pypi`, 100 package names, and seed 20261025. It accepts
-the worker count as its first argument, records `run.status`, and supports
-`SNATCHRS_BIN`/`SNATCHRS_MIRROR` overrides. It does not provision or format disks.
+The runner uses `snatchrs` from `PATH` unless `SNATCHRS_BIN` is provided. It records
+`run.status` under the chosen mirror root and does not provision or format disks.
 The verification script writes `verification.json`. It reports metadata errors
 separately and returns nonzero for artifact integrity errors or download failures.
 
@@ -254,14 +256,14 @@ includes an application.
 ```bash
 cargo build --release --locked
 ./target/release/snatchrs --version
-scp target/release/snatchrs ubuntu@remote-host:~/snatchrs
-ssh -t ubuntu@remote-host './snatchrs index'
+scp target/release/snatchrs user@example.org:~/snatchrs
+ssh -t user@example.org './snatchrs index'
 ```
 
 The release binary is `target/release/snatchrs`; the remote machine does not need
 Rust or the source tree. The commands above assume a compatible Linux machine
 with the same CPU architecture and compatible glibc. A binary built on a newer
-Ubuntu may not run on an older distribution. Use `file target/release/snatchrs`
+Linux distribution may not run on an older distribution. Use `file target/release/snatchrs`
 and `ldd target/release/snatchrs` to inspect the build. For other operating systems,
 architectures, or older Linux versions, build on a matching host or use a suitable
 cross-compilation toolchain. SSH needs `-t` to allocate a terminal for the dashboard.
@@ -269,6 +271,6 @@ cross-compilation toolchain. SSH needs `-t` to allocate a terminal for the dashb
 For an offline remote smoke test, copy the fixture too:
 
 ```bash
-scp tests/fixtures/index.json ubuntu@remote-host:~/snatchrs-fixture.json
-ssh -t ubuntu@remote-host './snatchrs index --from-file ~/snatchrs-fixture.json'
+scp tests/fixtures/index.json user@example.org:~/snatchrs-fixture.json
+ssh -t user@example.org './snatchrs index --from-file ~/snatchrs-fixture.json'
 ```
