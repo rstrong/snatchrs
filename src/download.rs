@@ -28,12 +28,29 @@ pub struct DownloadTask {
 pub fn build_tasks(packages: &[CheckedPackage]) -> Result<Vec<DownloadTask>> {
     let mut tasks: BTreeMap<PathBuf, DownloadTask> = BTreeMap::new();
     for package in packages {
-        let files = package
+        // check_package records one CheckedFile per metadata file, in order.
+        // Verify that pairing rather than trusting it: a misaligned pair would
+        // queue one file's URL and hash under another file's path.
+        let files: Vec<_> = package
             .metadata
             .releases
             .iter()
-            .flat_map(|release| &release.files);
-        for (file, checked) in files.zip(&package.files) {
+            .flat_map(|release| &release.files)
+            .collect();
+        ensure!(
+            files.len() == package.files.len(),
+            "Check results for {} cover {} of {} files",
+            package.metadata.package.normalized_name,
+            package.files.len(),
+            files.len()
+        );
+        for (file, checked) in files.into_iter().zip(&package.files) {
+            ensure!(
+                file.local_path == checked.local_path,
+                "Check result {} does not match metadata file {}",
+                checked.local_path.display(),
+                file.local_path.display()
+            );
             if !checked.state.needs_download() {
                 continue;
             }

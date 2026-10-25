@@ -8,6 +8,7 @@ use std::{
 
 use snatchrs::{
     IndexClient, Package, PackageIndex,
+    download::build_tasks,
     mirror::{
         CheckSummary, FileState, MetadataOutcome, MirrorLayout, PackageMetadata, check_package,
         inspect_file, sample_packages,
@@ -324,6 +325,28 @@ fn checks_missing_matching_wrong_sizes_and_non_files_without_downloading() {
         fs::read(layout.root.join(&checked.files[1].local_path)).unwrap(),
         b"x"
     );
+}
+
+#[test]
+fn build_tasks_rejects_check_results_misaligned_with_metadata() {
+    let directory = tempdir().unwrap();
+    let layout = MirrorLayout::create(directory.path()).unwrap();
+    let metadata = parse(FIXTURE, &layout).unwrap();
+    layout.save_metadata(&metadata).unwrap();
+    let mut checked = check_package(&layout.root, metadata, &mut CheckSummary::default());
+    assert_eq!(
+        build_tasks(std::slice::from_ref(&checked)).unwrap().len(),
+        4
+    );
+
+    checked.files.swap(0, 1);
+    let error = build_tasks(std::slice::from_ref(&checked)).unwrap_err();
+    assert!(error.to_string().contains("does not match"), "{error:#}");
+
+    checked.files.swap(0, 1);
+    checked.files.pop();
+    let error = build_tasks(std::slice::from_ref(&checked)).unwrap_err();
+    assert!(error.to_string().contains("cover 3 of 4"), "{error:#}");
 }
 
 #[test]
