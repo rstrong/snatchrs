@@ -2,12 +2,14 @@
 name = "snatchrs"
 version = "0.1.0"
 edition = "2024"
+# File::try_lock
+rust-version = "1.89"
 description = "An incremental PyPI mirror toolkit"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-fs2 = "0.4"
+fs4 = { version = "1.1.0", default-features = false }
 httpdate = "1"
 indicatif = "0.18"
 pep440_rs = "0.7"

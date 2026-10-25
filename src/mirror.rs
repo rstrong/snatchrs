@@ -213,7 +213,7 @@ impl MirrorLayout {
             .read(true)
             .write(true)
             .open(self.root.join(".snatchrs.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&file)
+        file.try_lock()
             .context("Another snatchrs command is using this mirror")?;
         Ok(file)
     }

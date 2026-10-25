@@ -223,7 +223,7 @@ fn reserve_space(root: &Path, budget: &Arc<Mutex<u64>>, bytes: u64) -> Result<Re
         .checked_add(bytes)
         .context("Reserved sizes overflow u64")?;
     ensure!(
-        fs2::available_space(root)? >= needed,
+        fs4::available_space(root)? >= needed,
         "Not enough disk space for {needed} bytes of active downloads"
     );
     *reserved = needed;
@@ -401,7 +401,7 @@ pub fn download_all(
             .context("Download sizes overflow u64")
     })?;
     ensure!(
-        fs2::available_space(root)? >= total,
+        fs4::available_space(root)? >= total,
         "Not enough disk space for {total} bytes of downloads"
     );
     let (_, report) = stream_with_workers(

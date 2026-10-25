@@ -42,7 +42,7 @@ using `--json` also selects plain output automatically. `--quiet` suppresses sta
 
 ## Run
 
-Install stable Rust (edition 2024 requires Rust 1.85 or newer), then:
+Install stable Rust (1.89 or newer, for `File::try_lock`), then:
 
 ```bash
 cargo run -- index
