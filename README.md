@@ -2,7 +2,28 @@
 
 A Rust starting point for a PyPI mirror, with a CLI inspired by uv:
 subcommands, concise status messages on stderr, pipeable results on stdout,
-`--quiet`, `--help`, and `--version`.
+`--quiet`, `--help`, and `--version`. This program should help build and maintain
+pypi mirrors for offline and air-gapped networks, similar to bandersnatch, but
+with the goal of being simple to deploy and maintain.
+
+## Quick start
+
+Install stable Rust, then run these commands from the project directory:
+
+```bash
+# Build the binary.
+cargo build --release --locked
+
+# Check one package against local files, without downloading anything.
+./target/release/snatchrs check --mirror ./mirror-shell --package packaging
+
+# Download its missing or wrong-sized files with four concurrent workers.
+./target/release/snatchrs mirror --mirror ./mirror-shell --package packaging --concurrency 4
+```
+
+Files and metadata are saved under `./mirror-shell`, with live terminal progress.
+All releases of the selected package are included. To select 100 random packages,
+replace `--package packaging` with `--sample 100`.
 
 In an interactive terminal, `snatchrs index` displays an animated dashboard:
 bytes read while decoding JSON, followed by a package progress bar, processed and
