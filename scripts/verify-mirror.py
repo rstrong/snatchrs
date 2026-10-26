@@ -32,7 +32,8 @@ def main():
         packages = map(json.loads, journal)
         for package in packages:
             metadata_packages += 1
-            for release in package["metadata"]["releases"]:
+            metadata = json.loads(mirror_path(package["metadata_path"]).read_text())
+            for release in metadata["releases"]:
                 for file in release["files"]:
                     path = mirror_path(file["local_path"])
                     if path in checked:
@@ -58,7 +59,8 @@ def main():
                            else report["downloads"]["progress"]["discovery"]["total_packages"]),
         "metadata_packages": metadata_packages,
         "unavailable_projects": report["inspection"].get("unavailable_count", 0),
-        "metadata_errors": [json.loads(line) for line in mirror_path(report["inspection"]["errors_path"]).read_text().splitlines()],
+        "metadata_errors": ([json.loads(line) for line in mirror_path(report["inspection"]["errors_path"]).read_text().splitlines()]
+                            if report["inspection"].get("errors_path") else []),
         "checked_files": len(checked), "sha256_verified_files": hashed,
         "verified_bytes": verified_bytes, "failures": failures,
         "download_failures": report["downloads"]["progress"]["failed"],

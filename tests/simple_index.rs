@@ -369,3 +369,125 @@ fn spaced_and_local_version_filenames_are_mirrored_with_encoded_links() {
     assert_eq!(verified["ok"], 2);
     assert_eq!(verified["project_errors"], 0);
 }
+
+#[test]
+fn clean_journals_are_compact_and_empty_error_journals_are_not_created() {
+    let server = Server::start();
+    let root = tempdir().unwrap();
+    let mirrored: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "mirror").stdout).unwrap();
+    let outcomes = fs::read_to_string(
+        root.path()
+            .join(mirrored["downloads"]["outcomes_path"].as_str().unwrap()),
+    )
+    .unwrap();
+    for line in outcomes.lines() {
+        let outcome: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(outcome.get("task").is_none());
+        assert!(outcome.get("sha256").is_none());
+        assert!(outcome.get("download_url").is_none());
+        assert_eq!(outcome["package"], "example-pkg");
+        assert_eq!(outcome["downloaded"], true);
+    }
+    let checked: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "check").stdout).unwrap();
+    for summary in [&mirrored["inspection"], &checked] {
+        assert!(summary.get("errors_path").is_none());
+        assert!(summary.get("unavailable_path").is_none());
+        let run = root.path().join(summary["packages_path"].as_str().unwrap());
+        assert!(!run.parent().unwrap().join("package-errors.jsonl").exists());
+        assert!(
+            !run.parent()
+                .unwrap()
+                .join("unavailable-projects.jsonl")
+                .exists()
+        );
+    }
+    let journal = root.path().join(checked["packages_path"].as_str().unwrap());
+    let records = fs::read_to_string(&journal).unwrap();
+    assert_eq!(records.lines().count(), 1);
+    let record: serde_json::Value = serde_json::from_str(records.lines().next().unwrap()).unwrap();
+    assert_eq!(record["matching_size"], 2);
+    assert_eq!(record["files"], 2);
+    assert!(record.get("problems").is_none());
+    assert!(record.get("metadata").is_none());
+    assert!(record.get("releases").is_none());
+    assert_eq!(record["metadata_path"], "metadata/example-pkg.json");
+    fs::write(
+        root.path().join("packages/example-pkg").join(FILENAMES[0]),
+        b"x",
+    )
+    .unwrap();
+    let checked: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "check").stdout).unwrap();
+    let records =
+        fs::read_to_string(root.path().join(checked["packages_path"].as_str().unwrap())).unwrap();
+    let record: serde_json::Value = serde_json::from_str(records.lines().next().unwrap()).unwrap();
+    assert_eq!(record["matching_size"], 1);
+    assert_eq!(record["size_mismatch"], 1);
+    let problems = record["problems"].as_array().unwrap();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0]["filename"], FILENAMES[0]);
+    assert_eq!(problems[0]["status"], "size_mismatch");
+    assert_eq!(problems[0]["actual_size"], 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn metadata_reports_journals_and_run_directories_are_readable_by_other_users() {
+    use std::os::unix::fs::PermissionsExt;
+    fn mode(path: &Path, expected: u32) {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            expected,
+            "{}",
+            path.display()
+        );
+    }
+    let root = tempdir().unwrap();
+    let server = Server::start();
+    let mirrored: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "mirror").stdout).unwrap();
+    for path in [
+        "metadata/example-pkg.json",
+        "check-report.json",
+        "mirror-report.json",
+        "mirror-progress.json",
+    ] {
+        mode(&root.path().join(path), 0o644);
+    }
+    for path in [
+        mirrored["inspection"]["packages_path"].as_str().unwrap(),
+        mirrored["downloads"]["outcomes_path"].as_str().unwrap(),
+    ] {
+        mode(&root.path().join(path), 0o644);
+        mode(root.path().join(path).parent().unwrap(), 0o755);
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
+        .arg("verify")
+        .arg(root.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let verified: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let path = root
+        .path()
+        .join(verified["problems_path"].as_str().unwrap());
+    mode(&path, 0o644);
+    mode(path.parent().unwrap(), 0o755);
+    mode(&root.path().join("verify-report.json"), 0o644);
+    server.unavailable.store(true, Ordering::Release);
+    let checked: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "check").stdout).unwrap();
+    mode(
+        &root
+            .path()
+            .join(checked["unavailable_path"].as_str().unwrap()),
+        0o644,
+    );
+}

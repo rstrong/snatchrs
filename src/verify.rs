@@ -428,11 +428,8 @@ pub fn run(
         ),
         Err(error) => return Err(error.into()),
     }
-    let run = tempfile::Builder::new()
-        .prefix("verify-")
-        .tempdir_in(reports)?
-        .keep();
-    let mut problems = BufWriter::new(File::create(run.join("problems.jsonl"))?);
+    let run = snatchrs::mirror::create_report_directory(&reports, "verify-")?;
+    let mut problems = snatchrs::mirror::create_jsonl(&run.join("problems.jsonl"))?;
     let mut report = VerifyReport {
         stale_temp_files_removed: _lock.stale_temp_files_removed,
         problems_path: run.strip_prefix(&layout.root)?.join("problems.jsonl"),

@@ -86,7 +86,7 @@ fn metadata_limit_is_respected_and_fast_results_pass_a_blocked_first_project() {
                                                 fs::read_dir(root.join("reports")).unwrap().any(|run| {
                                                     fs::read_to_string(run.unwrap().path().join("checked-packages.jsonl"))
                                                         .is_ok_and(|records| records.lines().any(|line| {
-                                                            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|p| p["metadata"]["package"]["name"] == "fast")
+                                                            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|p| p["name"] == "fast")
                                                         }))
                                                 })
                                             };
@@ -176,7 +176,7 @@ fn metadata_limit_is_respected_and_fast_results_pass_a_blocked_first_project() {
         assert_eq!(records.lines().count(), 3);
         let first: serde_json::Value =
             serde_json::from_str(records.lines().next().unwrap()).unwrap();
-        assert_eq!(first["metadata"]["package"]["name"], "fast");
+        assert_eq!(first["name"], "fast");
         if mode == "mirror" {
             assert_eq!(report["downloads"]["progress"]["downloaded"], 1);
             assert_eq!(report["final_check"]["matching_size"], 1);

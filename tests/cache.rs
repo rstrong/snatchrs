@@ -334,14 +334,7 @@ fn project_404_is_an_outcome_and_invalidates_only_metadata_cache() {
         assert_eq!(inspection["error_count"], 0);
         assert_eq!(inspection["unavailable_count"], 1);
         assert_eq!(inspection["summary"]["packages"], 0);
-        assert!(
-            fs::read_to_string(
-                root.path()
-                    .join(inspection["errors_path"].as_str().unwrap())
-            )
-            .unwrap()
-            .is_empty()
-        );
+        assert!(inspection.get("errors_path").is_none());
         assert!(
             fs::read_to_string(
                 root.path()
@@ -459,13 +452,13 @@ fn moving_a_mirror_preserves_reports_cache_hits_and_download_repairs() {
     assert_relative_paths(&report);
     fs::rename(&original_root, &moved_root).unwrap();
     // The earlier summary and JSONL links remain valid without rewriting them.
-    for field in ["packages_path", "errors_path", "unavailable_path"] {
-        assert!(
-            moved_root
-                .join(report["inspection"][field].as_str().unwrap())
-                .is_file()
-        );
-    }
+    assert!(
+        moved_root
+            .join(report["inspection"]["packages_path"].as_str().unwrap())
+            .is_file()
+    );
+    assert!(report["inspection"].get("errors_path").is_none());
+    assert!(report["inspection"].get("unavailable_path").is_none());
     let packages = fs::read_to_string(
         moved_root.join(report["inspection"]["packages_path"].as_str().unwrap()),
     )
@@ -478,7 +471,7 @@ fn moving_a_mirror_preserves_reports_cache_hits_and_download_repairs() {
         serde_json::from_str(outcomes.lines().next().unwrap()).unwrap();
     assert_relative_paths(&outcome);
     assert_eq!(
-        outcome["task"]["local_path"],
+        outcome["local_path"],
         "packages/cache-fixture/cache_fixture-1.0.tar.gz"
     );
     let cached = moved_root.join("metadata/cache-fixture.json");

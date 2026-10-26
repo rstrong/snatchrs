@@ -247,6 +247,17 @@ fn package_queue_errors_do_not_stop_later_projects() {
             .join(report["inspection"]["errors_path"].as_str().unwrap()),
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root
+            .path()
+            .join(report["inspection"]["errors_path"].as_str().unwrap());
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
     assert!(errors.contains("Conflicting metadata"));
     assert!(errors.contains("bad"));
     assert_eq!(

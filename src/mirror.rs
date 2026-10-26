@@ -331,6 +331,37 @@ pub(crate) fn create_directory(path: &Path) -> Result<()> {
     }
 }
 
+/// Files served or inspected by another user should be readable independently
+/// of tempfile's private defaults and the invoking process's umask.
+pub fn set_public_file_permissions(file: &fs::File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
+pub fn create_jsonl(path: &Path) -> Result<std::io::BufWriter<fs::File>> {
+    let file = fs::File::create(path)?;
+    set_public_file_permissions(&file)?;
+    Ok(std::io::BufWriter::new(file))
+}
+
+pub fn create_report_directory(reports: &Path, prefix: &str) -> Result<PathBuf> {
+    let directory = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(reports)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(directory.keep())
+}
+
 /// Write through a temporary file, preserving an existing report on failure.
 pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path
@@ -341,6 +372,7 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         .tempfile_in(parent)?;
     serde_json::to_writer_pretty(&mut file, value)?;
     writeln!(file)?;
+    set_public_file_permissions(file.as_file())?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|error| error.error)?;
     Ok(())

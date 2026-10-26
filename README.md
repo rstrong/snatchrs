@@ -365,14 +365,14 @@ The inspection summary also records `checked` (successful local inspections),
 selection. Queue-wide errors appear once in the error journal with name
 `<queue>` and do not inflate the package-error count.
 
-- `reports/run-*/checked-packages.jsonl`: one checked package per line, including metadata and initial file states (`inspection.packages_path`).
-- `reports/run-*/package-errors.jsonl`: one metadata/queue error per line (`inspection.errors_path`).
-- `reports/run-*/unavailable-projects.jsonl`: one project metadata 404 per line, with name, requested metadata URL, `status: "not_found"`, and `http_status: 404` (`inspection.unavailable_path`).
-- `reports/run-*/download-outcomes.jsonl`: one completed download outcome per line, including failures.
+- `reports/run-*/checked-packages.jsonl`: one compact inspection per project: name, last serial, mirror-relative `metadata_path`, `release_count`, file-state counts, and `problems` containing only non-matching files. Healthy files have no per-file run records; their URLs, hashes, sizes, and other metadata stay in `metadata/<name>.json`. `problems` is omitted when empty (`inspection.packages_path`).
+- `reports/run-*/package-errors.jsonl`: one metadata/queue error per line, created only on the first error. `inspection.errors_path` is absent when no error journal was created.
+- `reports/run-*/unavailable-projects.jsonl`: one project metadata 404 per line, with name, requested metadata URL, `status: "not_found"`, and `http_status: 404`. Created only on the first 404; `inspection.unavailable_path` is absent otherwise.
+- `reports/run-*/download-outcomes.jsonl`: one flat completed outcome per line, including failures: `package`, `filename`, `local_path`, `size`, `attempts`, `downloaded`, `sha256_verified`, and `error`. URLs and hashes are not copied into the journal.
 
 Both `check` and `mirror` append details as work completes, rather than retaining
 all package metadata or completed download outcomes in memory. Final size checks
-read one checked package at a time. `--json` prints the compact summary, using the
+read one project's metadata cache at a time through its journal reference. `--json` prints the compact summary, using the
 same format as the saved report. The previous inline `packages`, `errors`, and
 `downloads.outcomes` arrays have been replaced by the JSONL paths above; consumers
 should stream those files line by line. Selected names are retained for explicit lists/samples, and `--all` retains root-index
@@ -380,9 +380,14 @@ identities for authoritative pruning. Download deduplication keeps only the
 current package's paths and fingerprints. Metadata held by active workers and
 the bounded result buffer must also fit in memory.
 
-Each run has its own detail directory. Earlier report paths remain readable after
-subsequent runs; completed and interrupted run directories are kept for inspection
-and can be removed when their reports are no longer needed. JSONL files may end
+Each run has its own detail directory with compact counts, problem files, and
+completed download outcomes. It references the shared `metadata/` cache rather
+than copying it; metadata describes the latest inspection, not a historical
+snapshot for each run. Earlier journal paths remain readable after subsequent
+runs. Completed and interrupted run directories are kept for inspection and can
+be removed when their reports are no longer needed. JSON files and JSONL journals
+are readable by other users (0644), and run/verify directories are traversable
+(0755), so a separate nginx user can read them. JSONL files may end
 with an incomplete line if the process is interrupted; only complete lines should
 be consumed from an interrupted run.
 

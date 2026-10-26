@@ -530,13 +530,7 @@ fn cli_saves_metadata_and_report_and_continues_after_unavailable_project() {
     assert_eq!(report["error_count"], 0);
     assert_eq!(report["unavailable_count"], 1);
     assert!(report.get("packages").is_none());
-    let errors = fs::read_to_string(
-        directory
-            .path()
-            .join(report["errors_path"].as_str().unwrap()),
-    )
-    .unwrap();
-    assert!(errors.is_empty());
+    assert!(report.get("errors_path").is_none());
     let unavailable = fs::read_to_string(
         directory
             .path()
@@ -554,9 +548,9 @@ fn cli_saves_metadata_and_report_and_continues_after_unavailable_project() {
             .join(report["packages_path"].as_str().unwrap()),
     )
     .unwrap();
-    let checked: snatchrs::mirror::CheckedPackage =
+    let checked: serde_json::Value =
         serde_json::from_str(packages.lines().next().unwrap()).unwrap();
-    assert_eq!(checked.files.len(), 4);
+    assert_eq!(checked["files"], 4);
     assert_eq!(packages.lines().count(), 1);
     assert!(directory.path().join("metadata/example-pkg.json").is_file());
     assert!(directory.path().join("check-report.json").is_file());

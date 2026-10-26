@@ -426,8 +426,8 @@ fn mirror_respects_samples_above_one_hundred_and_smaller_indexes() {
         .unwrap();
         assert_eq!(checked.lines().count(), expected);
         for line in checked.lines() {
-            let package: snatchrs::mirror::CheckedPackage = serde_json::from_str(line).unwrap();
-            assert_eq!(package.files.len(), 1);
+            let package: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(package["files"], 1);
         }
         let outcomes = fs::read_to_string(
             directory

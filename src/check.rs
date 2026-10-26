@@ -12,14 +12,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::report::{CheckedPackageLine, DownloadOutcomeLine, PackageReference};
 use anyhow::{Context, Result, ensure};
 use clap::{ArgGroup, Args};
 use serde::Serialize;
 use snatchrs::{
     DEFAULT_INDEX_URL, IndexClient, IndexProgress, Package,
     mirror::{
-        CheckSummary, CheckedPackage, MetadataOutcome, MirrorLayout, check_package,
-        sample_packages, write_json,
+        CheckSummary, MetadataOutcome, MirrorLayout, check_package, sample_packages, write_json,
     },
 };
 use url::Url;
@@ -159,12 +159,14 @@ struct CheckReport {
     selected_packages: Option<Vec<String>>,
     summary: CheckSummary,
     packages_path: PathBuf,
-    errors_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    errors_path: Option<PathBuf>,
     error_count: usize,
     checked: usize,
     not_inspected: usize,
     queue_error: Option<String>,
-    unavailable_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_path: Option<PathBuf>,
     unavailable_count: usize,
 }
 
@@ -172,8 +174,36 @@ struct CheckReport {
 // older report at truncated or partially overwritten details from a newer run.
 struct InspectionJournal {
     packages: BufWriter<File>,
-    errors: BufWriter<File>,
-    unavailable: BufWriter<File>,
+    errors: LazyJournal,
+    unavailable: LazyJournal,
+}
+
+struct LazyJournal {
+    root: PathBuf,
+    path: PathBuf,
+    file: Option<BufWriter<File>>,
+}
+impl LazyJournal {
+    fn new(root: &std::path::Path, path: PathBuf) -> Self {
+        Self {
+            root: root.into(),
+            path,
+            file: None,
+        }
+    }
+    fn append(&mut self, report_path: &mut Option<PathBuf>, value: &impl Serialize) -> Result<()> {
+        if self.file.is_none() {
+            self.file = Some(snatchrs::mirror::create_jsonl(&self.root.join(&self.path))?);
+            *report_path = Some(self.path.clone());
+        }
+        append_jsonl(self.file.as_mut().expect("journal was opened"), value)
+    }
+    fn sync(&self) -> Result<()> {
+        if let Some(file) = &self.file {
+            file.get_ref().sync_all()?;
+        }
+        Ok(())
+    }
 }
 
 fn append_jsonl(file: &mut BufWriter<File>, value: &impl Serialize) -> Result<()> {
@@ -189,7 +219,7 @@ fn record_error(
     error: PackageError,
 ) -> Result<()> {
     report.error_count += 1;
-    append_jsonl(&mut journal.errors, &error)?;
+    journal.errors.append(&mut report.errors_path, &error)?;
     Ok(())
 }
 
@@ -200,8 +230,8 @@ fn record_unavailable(
     metadata_url: Url,
 ) -> Result<()> {
     report.unavailable_count += 1;
-    append_jsonl(
-        &mut journal.unavailable,
+    journal.unavailable.append(
+        &mut report.unavailable_path,
         &serde_json::json!({
             "name": name, "status": "not_found", "http_status": 404,
             "metadata_url": metadata_url,
@@ -212,7 +242,7 @@ fn record_unavailable(
 
 fn visit_packages(
     path: &std::path::Path,
-    mut visit: impl FnMut(CheckedPackage) -> Result<()>,
+    mut visit: impl FnMut(PackageReference) -> Result<()>,
 ) -> Result<()> {
     for line in BufReader::new(File::open(path)?).lines() {
         let package =
@@ -365,18 +395,15 @@ fn run_inner(
     };
     let reports = layout.root.join("reports");
     fs::create_dir_all(&reports)?;
-    let run_dir = tempfile::Builder::new()
-        .prefix("run-")
-        .tempdir_in(reports)?
-        .keep();
+    let run_dir = snatchrs::mirror::create_report_directory(&reports, "run-")?;
     let run_dir = run_dir.strip_prefix(&layout.root)?.to_path_buf();
     let packages_path = run_dir.join("checked-packages.jsonl");
     let errors_path = run_dir.join("package-errors.jsonl");
     let unavailable_path = run_dir.join("unavailable-projects.jsonl");
     let mut journal = InspectionJournal {
-        packages: BufWriter::new(File::create(layout.root.join(&packages_path))?),
-        errors: BufWriter::new(File::create(layout.root.join(&errors_path))?),
-        unavailable: BufWriter::new(File::create(layout.root.join(&unavailable_path))?),
+        packages: snatchrs::mirror::create_jsonl(&layout.root.join(&packages_path))?,
+        errors: LazyJournal::new(&layout.root, errors_path),
+        unavailable: LazyJournal::new(&layout.root, unavailable_path),
     };
     let mut report = CheckReport {
         mirror_root: PathBuf::from("."),
@@ -394,12 +421,12 @@ fn run_inner(
         }),
         summary: CheckSummary::default(),
         packages_path,
-        errors_path,
+        errors_path: None,
         error_count: 0,
         checked: 0,
         not_inspected: 0,
         queue_error: None,
-        unavailable_path,
+        unavailable_path: None,
         unavailable_count: 0,
     };
     if let Some(options) = download {
@@ -439,7 +466,7 @@ fn run_inner(
                 Ok(MetadataOutcome::Available(metadata)) => {
                     report.checked += 1;
                     let checked = check_package(&layout.root, *metadata, &mut report.summary);
-                    append_jsonl(&mut journal.packages, &checked)?;
+                    append_jsonl(&mut journal.packages, &CheckedPackageLine::from(&checked))?;
                 }
                 Ok(MetadataOutcome::NotFound { metadata_url }) => {
                     record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
@@ -471,8 +498,8 @@ fn run_inner(
     report.stale_temp_files_removed += report.summary.stale_temp_files_removed;
     snatchrs::cleanup::announce(report.stale_temp_files_removed, quiet);
     journal.packages.get_ref().sync_all()?;
-    journal.errors.get_ref().sync_all()?;
-    journal.unavailable.get_ref().sync_all()?;
+    journal.errors.sync()?;
+    journal.unavailable.sync()?;
     let report_path = layout.root.join("check-report.json");
     write_json(&report_path, &report)?;
     if let Some(dashboard) = &dashboard {
@@ -492,26 +519,14 @@ fn run_inner(
         writeln!(stdout)?;
     } else if !interactive {
         visit_packages(&layout.root.join(&report.packages_path), |package| {
-            let missing = package
-                .files
-                .iter()
-                .filter(|file| matches!(file.state, snatchrs::mirror::FileState::Missing))
-                .count();
-            let mismatch = package
-                .files
-                .iter()
-                .filter(|file| {
-                    matches!(file.state, snatchrs::mirror::FileState::SizeMismatch { .. })
-                })
-                .count();
             writeln!(
                 stdout,
                 "{}: {} releases, {} files · {} missing, {} size mismatches",
-                package.metadata.package.normalized_name,
-                package.metadata.releases.len(),
-                package.files.len(),
-                missing,
-                mismatch
+                package.name,
+                package.release_count,
+                package.files,
+                package.missing,
+                package.size_mismatch
             )?;
             Ok(())
         })?;
@@ -596,8 +611,8 @@ fn run_pipeline(
         .context("Missing run directory")?
         .join("download-outcomes.jsonl");
     let (mut outcomes_file, outcome_open_error) =
-        match File::create(layout.root.join(&outcomes_path)) {
-            Ok(file) => (Some(BufWriter::new(file)), None),
+        match snatchrs::mirror::create_jsonl(&layout.root.join(&outcomes_path)) {
+            Ok(file) => (Some(file), None),
             Err(error) => (
                 None,
                 Some(format!("Cannot open download outcomes: {error}")),
@@ -685,7 +700,7 @@ fn run_pipeline(
                 outcomes_file
                     .as_mut()
                     .context("Download outcomes unavailable")?,
-                outcome,
+                &DownloadOutcomeLine::from(outcome),
             )
         },
     );
@@ -738,13 +753,30 @@ fn run_pipeline(
     let mut final_check = CheckSummary::default();
     let mut simple_index = snatchrs::simple::SimpleSummary::default();
     if let Err(error) = visit_packages(&layout.root.join(&inspection.packages_path), |package| {
-        match snatchrs::simple::write_project_page(&layout.root, &package.metadata) {
-            Ok(page) => simple_index.add(page),
-            Err(error) => {
-                simple_index.record_error(package.metadata.package.normalized_name.clone(), error)
+        let loaded = (|| -> Result<snatchrs::mirror::PackageMetadata> {
+            ensure!(
+                package.metadata_path
+                    == PathBuf::from("metadata")
+                        .join(format!("{}.json", snatchrs::normalize_name(&package.name)?)),
+                "Unexpected metadata path in journal"
+            );
+            let path = snatchrs::mirror::resolve_path(&layout.root, &package.metadata_path)?;
+            ensure!(
+                fs::symlink_metadata(&path)?.file_type().is_file(),
+                "Expected a regular metadata file"
+            );
+            Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
+        })();
+        match loaded {
+            Ok(metadata) => {
+                match snatchrs::simple::write_project_page(&layout.root, &metadata) {
+                    Ok(page) => simple_index.add(page),
+                    Err(error) => simple_index.record_error(package.name, error),
+                }
+                check_package(&layout.root, metadata, &mut final_check);
             }
+            Err(error) => simple_index.record_error(package.name, error),
         }
-        check_package(&layout.root, package.metadata, &mut final_check);
         Ok(())
     }) {
         simple_index.record_error("<inspection>", error);
@@ -885,8 +917,8 @@ fn stop_inspection(
         report.queue_error = Some(reason.clone());
         // An exhausted filesystem may also reject this journal append. Keep
         // the reason in the in-memory summary so saving the report is attempted.
-        let _ = append_jsonl(
-            &mut journal.errors,
+        let _ = journal.errors.append(
+            &mut report.errors_path,
             &PackageError {
                 name: "<queue>".into(),
                 error: reason.clone(),
@@ -931,7 +963,10 @@ fn inspect_stream(
                                 check_package(&layout.root, *metadata, &mut report.summary);
                             let tasks =
                                 snatchrs::download::build_tasks(std::slice::from_ref(&checked));
-                            append_jsonl(&mut journal.packages, &checked)?;
+                            append_jsonl(
+                                &mut journal.packages,
+                                &CheckedPackageLine::from(&checked),
+                            )?;
                             let queued = tasks.and_then(|tasks| {
                                 for task in tasks {
                                     queue.enqueue(task)?;
@@ -998,8 +1033,8 @@ fn inspect_stream(
     }
     let saved = (|| -> Result<()> {
         journal.packages.get_ref().sync_all()?;
-        journal.errors.get_ref().sync_all()?;
-        journal.unavailable.get_ref().sync_all()?;
+        journal.errors.sync()?;
+        journal.unavailable.sync()?;
         write_json(&layout.root.join("check-report.json"), &report)
     })();
     if let Err(error) = saved {

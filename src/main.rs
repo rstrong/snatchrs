@@ -14,6 +14,7 @@ use url::Url;
 mod check;
 mod download_ui;
 mod progress;
+mod report;
 mod verify;
 
 #[derive(Parser)]

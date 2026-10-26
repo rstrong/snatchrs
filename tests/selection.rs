@@ -158,7 +158,15 @@ fn all_mirrors_in_index_order_without_names_in_report_and_prunes_deleted_pages_o
             .join(report["inspection"]["packages_path"].as_str().unwrap()),
     )
     .unwrap();
-    let names: Vec<String> = records.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["metadata"]["package"]["normalized_name"].as_str().unwrap().to_owned()).collect();
+    let names: Vec<String> = records
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["name"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
     assert_eq!(names, ["zulu", "beta", "alpha"]);
     let root_page = fs::read_to_string(root.path().join("simple/index.html")).unwrap();
     for name in &names {
