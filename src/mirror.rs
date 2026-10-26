@@ -301,7 +301,7 @@ pub fn resolve_path(root: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(root.join(relative))
 }
 
-fn create_directory(path: &Path) -> Result<()> {
+pub(crate) fn create_directory(path: &Path) -> Result<()> {
     match fs::create_dir(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -484,7 +484,7 @@ impl Yanked {
     }
 }
 
-fn validate_filename(filename: &str) -> Result<()> {
+pub(crate) fn validate_filename(filename: &str) -> Result<()> {
     ensure!(
         !filename.is_empty()
             && filename != "."

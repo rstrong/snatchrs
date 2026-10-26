@@ -21,7 +21,9 @@ cargo build --release --locked
 ./target/release/snatchrs mirror --mirror ./mirror-shell --package packaging --concurrency 4
 ```
 
-Files and metadata are saved under `./mirror-shell`, with live terminal progress.
+Files, metadata, and static HTML Simple Index pages are saved under `./mirror-shell`,
+with live terminal progress. See [Serving the mirror](#serving-the-mirror) for nginx,
+pip, and uv setup.
 All releases of the selected package are included. To select 100 random packages,
 replace `--package packaging` with `--sample 100`.
 
@@ -285,7 +287,9 @@ Saved files include:
 
 - `check-report.json`: selected names, seed, inspection counters, `error_count`, and paths to detail files; written when discovery ends.
 - `mirror-progress.json`: periodically updated checking, worker, and transfer progress.
-- `mirror-report.json`: inspection summary, download counters, `downloads.outcomes_path`, and final size checks.
+- `mirror-report.json`: inspection summary, download counters, `downloads.outcomes_path`, and final size checks. The
+  `simple_index` object records `projects`, `files_linked`, and `files_skipped` for
+  pages generated during that run (the root index also retains earlier projects).
 - `reports/run-*/checked-packages.jsonl`: one checked package per line, including metadata and initial file states (`inspection.packages_path`).
 - `reports/run-*/package-errors.jsonl`: one metadata/queue error per line (`inspection.errors_path`).
 - `reports/run-*/unavailable-projects.jsonl`: one project metadata 404 per line, with name, requested metadata URL, `status: "not_found"`, and `http_status: 404` (`inspection.unavailable_path`).
@@ -308,8 +312,8 @@ be consumed from an interrupted run.
 
 Any metadata errors, failed downloads, missing/wrong-sized files, or blocked paths
 produce a nonzero exit code after the final report is saved. Reports use atomic
-replacement. The tool currently mirrors artifacts and metadata; serving a pip
-compatible Simple Index is a later step.
+replacement. Mirror runs also publish a static HTML Simple Index usable by pip
+and uv; see [Serving the mirror](#serving-the-mirror).
 
 For a 10,000-package download run:
 
@@ -449,6 +453,117 @@ For an offline remote smoke test, copy the fixture too:
 scp tests/fixtures/index.json user@example.org:~/snatchrs-fixture.json
 ssh -t user@example.org './snatchrs index --from-file ~/snatchrs-fixture.json'
 ```
+
+## Serving the mirror
+
+`snatchrs mirror` writes static HTML [Simple API](https://packaging.python.org/en/latest/specifications/simple-repository-api/)
+pages after downloads finish. The mirror root contains:
+
+```text
+simple/index.html                        # sorted links to all existing project pages
+simple/<normalized-name>/index.html       # links to available local distributions
+packages/<normalized-name>/<filename>     # existing artifact layout
+```
+
+Project pages link only distributions whose local files currently have the
+expected size. Missing, wrong-sized, symlinked, and other nonregular files are not
+linked. Available links include the upstream SHA256 when known, `requires-python`,
+and yanked status. Filenames are percent-encoded; all HTML attributes and text
+are escaped. Pages are written atomically and use mode 0644 on Unix. Files are
+not rehashed during page generation: size checks retain the existing mirror's
+verification policy. Only HTML is served; JSON Simple API responses and content
+negotiation are not implemented.
+
+To generate pages for an existing mirror, or update links after manually removing
+artifacts, run:
+
+```bash
+./target/release/snatchrs simple --mirror /srv/pypi
+```
+
+This takes the mirror lock, reads one `metadata/*.json` file at a time, and prints
+counts of projects written, files linked, and files skipped as not present. It
+uses local metadata without network access. Root-index generation scans existing
+`simple/<name>/index.html` pages, so earlier sampled projects remain discoverable.
+A metadata 404 during `mirror` removes that project's page and root-index entry,
+while retaining its local artifacts. `check` does not create, update, or remove
+pages. If metadata itself was manually removed, remove its obsolete project page
+too before rebuilding the root index; the standalone command does not infer
+project deletion from absent metadata.
+
+A minimal [nginx](https://nginx.org/en/docs/http/ngx_http_core_module.html#try_files)
+server block exposes only the two public trees:
+
+```nginx
+server {
+    listen 80;
+    server_name mirror.example.org;
+    root /srv/pypi;
+    index index.html;
+
+    location /simple/ {
+        try_files $uri $uri/ =404;
+    }
+    location /packages/ {
+        try_files $uri =404;
+    }
+    location / {
+        return 404;
+    }
+}
+```
+
+Point `root` at the complete mirror root and give the nginx worker read access to
+public files and traversal access to their parent directories. Keep `metadata/`,
+`reports/`, lock files, and root-level JSON reports private: the fallback location
+above refuses them. The Python static server used in tests serves the whole root
+and is only a loopback test fixture, not this production access policy.
+
+For pip, replace its index with the mirror's `/simple/` URL. For plain HTTP,
+explicitly trust that hostname:
+
+```bash
+python3 -m pip install --index-url http://mirror.example.org/simple/ --trusted-host mirror.example.org packaging
+```
+
+The equivalent Linux user configuration in `~/.config/pip/pip.conf` is:
+
+```ini
+[global]
+index-url = http://mirror.example.org/simple/
+trusted-host = mirror.example.org
+```
+
+For HTTPS with a valid certificate, use an `https://` index URL and omit
+`trusted-host`. See pip's [index option](https://pip.pypa.io/en/stable/cli/pip_install/#cmdoption-index-url)
+and [configuration reference](https://pip.pypa.io/en/stable/topics/configuration/).
+The mirror must contain the requested package and its dependencies; a sampled
+mirror may not contain every dependency needed for an install.
+
+With uv, select the same index directly or through its environment variable:
+
+```bash
+uv pip install --index-url http://mirror.example.org/simple/ packaging
+UV_INDEX_URL=http://mirror.example.org/simple/ uv pip install packaging
+```
+
+See uv's [index options](https://docs.astral.sh/uv/reference/cli/#uv-pip-install--index-url).
+
+The end-to-end pip smoke test builds a valid wheel using only Python's standard
+library, mirrors it from a loopback fixture, stops the upstream fixture, and uses
+real pip to download the wheel through a second static HTTP server. It checks a
+`+local` filename and the downloaded bytes/hash:
+
+```bash
+python3 scripts/pip-smoke.py --binary ./target/release/snatchrs
+# If the system Python does not have pip:
+uv venv --seed /tmp/snatchrs-pip-test
+python3 scripts/pip-smoke.py --binary ./target/release/snatchrs --pip '/tmp/snatchrs-pip-test/bin/python -m pip'
+```
+
+The script itself has no third-party Python dependencies. `--pip` accepts a pip
+executable or command and defaults to `python3 -m pip`; `--temp-root` optionally
+controls the location of its automatically cleaned fixture directories.
 
 ## License
 

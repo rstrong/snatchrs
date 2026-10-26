@@ -443,6 +443,7 @@ struct MirrorReport<'a> {
     inspection: &'a CheckReport,
     downloads: MirrorDownloads<'a>,
     final_check: snatchrs::mirror::CheckSummary,
+    simple_index: snatchrs::simple::SimpleSummary,
 }
 
 #[derive(Serialize)]
@@ -534,12 +535,19 @@ fn run_pipeline(
         ui.finish(&downloads.progress);
     }
     let mut final_check = CheckSummary::default();
+    let mut simple_index = snatchrs::simple::SimpleSummary::default();
     visit_packages(&layout.root.join(&inspection.packages_path), |package| {
+        simple_index.add(snatchrs::simple::write_project_page(
+            &layout.root,
+            &package.metadata,
+        )?);
         check_package(&layout.root, package.metadata, &mut final_check);
         Ok(())
     })?;
+    snatchrs::simple::write_root_index(&layout.root)?;
     let report = MirrorReport {
         final_check,
+        simple_index,
         inspection: &inspection,
         downloads: MirrorDownloads {
             concurrency: downloads.concurrency,
@@ -653,6 +661,7 @@ fn inspect_stream(
                     }
                 }
                 Ok(MetadataOutcome::NotFound { metadata_url }) => {
+                    snatchrs::simple::remove_project_page(&layout.root, &name)?;
                     record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
                 }
                 Err(error) => record_error(

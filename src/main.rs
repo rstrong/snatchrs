@@ -37,6 +37,11 @@ enum Command {
     Mirror(check::MirrorArgs),
     /// Inspect release metadata and local files for a small package sample.
     Check(check::CheckArgs),
+    /// Regenerate static HTML Simple Index pages from saved metadata.
+    Simple {
+        #[arg(long, default_value = "mirror-shell")]
+        mirror: PathBuf,
+    },
     /// Load the Simple Index and list its packages.
     Index {
         #[arg(long, default_value = DEFAULT_INDEX_URL)]
@@ -57,6 +62,19 @@ fn run(cli: Cli) -> Result<()> {
             return check::run_mirror(args, cli.quiet, cli.no_progress, cli.attempts);
         }
         Command::Check(args) => return check::run(args, cli.quiet, cli.no_progress, cli.attempts),
+        Command::Simple { mirror } => {
+            let layout = snatchrs::mirror::MirrorLayout::create(&mirror)?;
+            let _lock = layout.lock()?;
+            let summary = snatchrs::simple::regenerate(&layout.root)?;
+            let mut stdout = io::BufWriter::new(io::stdout().lock());
+            writeln!(
+                stdout,
+                "Simple index: {} projects written · {} files linked · {} files skipped as not present",
+                summary.projects, summary.files_linked, summary.files_skipped
+            )?;
+            stdout.flush()?;
+            return Ok(());
+        }
         Command::Index {
             index_url,
             from_file,
