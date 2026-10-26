@@ -123,33 +123,10 @@ cargo run -- --quiet index --from-file tests/fixtures/index.json --json
 enriched `--json` output. `--index-url` determines the package URLs when reading
 a fixture.
 
-## Package model
-
-`PackageIndex` owns a `Vec<Package>` and supports iteration by reference. Each
-`Package` contains the original name, normalized name, package Simple Index URL,
-and optional PyPI last-change serial. The index also preserves its API version
-and optional repository serial.
-
-```rust,no_run
-use snatchrs::{IndexClient, DEFAULT_INDEX_URL};
-
-fn main() -> anyhow::Result<()> {
-    let index = IndexClient::new()?.fetch(DEFAULT_INDEX_URL.parse()?)?;
-    for package in &index {
-        println!("{}: {}", package.normalized_name, package.index_url);
-        // Add validation or per-package metadata loading here next.
-    }
-    Ok(())
-}
-```
-
-The parser uses the [JSON Simple Index API](https://docs.pypi.org/api/index-api/),
-which PyPI recommends for new integrations, and follows the
-[PyPA name normalization rules](https://packaging.python.org/en/latest/specifications/name-normalization/).
-It accepts API major version 1 and ignores unknown response fields.
-Malformed names and malformed responses produce errors instead of being skipped.
-The root index supplies discovery data. The `check` command enriches selected
-packages with release and file metadata as described below.
+snatchrs uses the [JSON Simple Index API](https://docs.pypi.org/api/index-api/)
+and follows the [PyPA name normalization rules](https://packaging.python.org/en/latest/specifications/name-normalization/).
+It accepts API major version 1 and ignores unknown response fields; malformed
+names and responses produce errors instead of being skipped.
 
 ## Inspect a mirror shell
 
@@ -199,13 +176,12 @@ repeat-run file checks. Download URLs remain absolute HTTP/HTTPS URLs.
 Legacy metadata caches containing absolute paths are fetched again when selected
 and replaced with relative paths; existing distribution files are still checked
 and reused. Historical reports from older versions are not rewritten.
-`PackageMetadata` contains the package, metadata URL, metadata file path, package
-directory, last serial, and every release version. `Release` contains all its
-distribution files (all wheels and source distributions, including yanked files).
-Empty releases advertised by the index are preserved. Versions are ordered lexically, not by Python
-version precedence. Each `DistributionFile` contains filename, download URL, local
-path, expected byte size, optional SHA256, distribution type, Python requirement,
-and yanked state.
+Saved metadata records the project name, metadata URL and file path, package
+directory, last serial, and every release version. Each release lists all wheels
+and source distributions, including yanked files. Empty releases advertised by
+the index are preserved. Versions are ordered lexically, not by Python version
+precedence. Each file records its filename, download URL, local path, expected
+byte size, optional SHA256, distribution type, Python requirement, and yanked state.
 
 `check` and `mirror` use the per-project
 [Simple JSON API](https://docs.pypi.org/api/index-api/#get-distributions-for-project):
@@ -449,8 +425,7 @@ separately and returns nonzero for artifact integrity errors or download failure
 
 `--attempts` applies to index requests, per-project metadata requests, and file
 downloads. It defaults to 3 total attempts, including the initial request, and
-accepts 1–10. Use `--attempts 1` to disable retries. Library callers can configure
-metadata/index attempts with `IndexClient::with_attempts(n)`.
+accepts 1–10. Use `--attempts 1` to disable retries.
 
 Retryable failures are connection/request timeouts, interrupted connections or
 response bodies, and HTTP **408, 429, 500, 502, 503, and 504**. Other HTTP errors
@@ -513,6 +488,8 @@ cargo test --test proxy
 ```
 
 ## Development
+
+The `snatchrs` library target is internal (shared by the binary and tests); it has no stable API and is not published.
 
 ```bash
 cargo fmt --check

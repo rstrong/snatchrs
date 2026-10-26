@@ -1,4 +1,7 @@
-//! Discover PyPI projects, load release metadata, and check local mirror files.
+//! snatchrs is a command-line tool; use the `snatchrs` CLI.
+//! This library target exists only to share code between the binary and its tests.
+//! It has no stable API and may change in any release without notice.
+//! It is not published to crates.io.
 
 pub mod download;
 mod filename;
