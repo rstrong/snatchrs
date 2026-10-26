@@ -14,6 +14,7 @@ use url::Url;
 mod check;
 mod download_ui;
 mod progress;
+mod verify;
 
 #[derive(Parser)]
 #[command(version, about = "Discover, inspect, and mirror PyPI packages")]
@@ -43,6 +44,8 @@ enum Command {
         #[arg(value_name = "DIR")]
         mirror: PathBuf,
     },
+    /// Check every mirrored file against its recorded SHA256
+    Verify(verify::VerifyArgs),
     /// Load the Simple Index and list its packages.
     Index {
         /// Root Simple Index URL.
@@ -64,6 +67,7 @@ fn run(cli: Cli) -> Result<()> {
             return check::run_mirror(args, cli.quiet, cli.no_progress, cli.attempts);
         }
         Command::Check(args) => return check::run(args, cli.quiet, cli.no_progress, cli.attempts),
+        Command::Verify(args) => return verify::run(args, cli.quiet, cli.no_progress),
         Command::Simple { mirror } => {
             let layout = snatchrs::mirror::MirrorLayout::create(&mirror)?;
             let _lock = layout.lock()?;

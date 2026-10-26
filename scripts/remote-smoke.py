@@ -83,6 +83,17 @@ def main():
             assert verified["metadata_packages"] == 1
             assert verified["checked_files"] == 2
             assert verified["sha256_verified_files"] == 2
+            requests_before_verify = len(requests)
+            rust_verify = subprocess.run([
+                str(args.binary.resolve()), "verify", str(root), "--json"
+            ], capture_output=True, text=True, timeout=30)
+            if rust_verify.returncode:
+                raise RuntimeError(rust_verify.stdout + rust_verify.stderr)
+            rust_report = json.loads(rust_verify.stdout)
+            assert rust_report["ok"] == 2
+            assert rust_report["project_errors"] == 0
+            assert rust_report["bytes_hashed"] == sum(map(len, bodies.values()))
+            assert len(requests) == requests_before_verify
             relocated = run("mirror", "--concurrency", "2")
             assert relocated["downloads"]["progress"]["downloaded"] == 0
             assert relocated["final_check"]["matching_size"] == 2

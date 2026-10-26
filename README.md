@@ -270,8 +270,8 @@ size checks require them. There is no fallback to the deprecated project JSON AP
 
 File inspection records `missing`, `size_mismatch` (including actual size),
 `matching_size`, `not_regular_file`, or `error`. A matching size is only a size
-check; hashes are retained but not verified yet. Existing distributions are never
-modified. Unsafe filenames and symlinked package directories are rejected.
+check; use `snatchrs verify` to validate recorded hashes. Inspection never modifies
+existing distributions. Unsafe filenames and symlinked package directories are rejected.
 
 `check` never downloads files; missing and size-mismatched files are counted in the
 report summary. Blocked paths are reported separately.
@@ -342,7 +342,7 @@ error. Active downloads finish; untouched queued jobs are not attempted. The fin
 report is still saved on handled stop/error paths. Report persistence itself
 requires a writable mirror filesystem. A filesystem lock prevents simultaneous
 `check`, `mirror`, and `simple` commands from using the same root. Existing files
-are checked by size only; their hashes are not revalidated on subsequent runs.
+are checked by size only; use `snatchrs verify` to revalidate their recorded hashes.
 
 In one terminal display, progress includes packages checked and the current name,
 metadata errors, unavailable projects, files discovered, queued/active downloads, byte counts, transfer
@@ -536,6 +536,40 @@ For an offline remote smoke test, copy the fixture too:
 scp tests/fixtures/index.json user@example.org:~/snatchrs-fixture.json
 ssh -t user@example.org './snatchrs index --from-file ~/snatchrs-fixture.json'
 ```
+
+## Verifying a mirror
+
+```sh
+snatchrs verify ./mirror
+snatchrs verify ./mirror --package packaging -j 4
+```
+
+Verification works offline, takes the mirror lock, and streams each file's SHA256
+against saved metadata. It checks sizes and rejects symlinks and unsafe paths.
+Files without a recorded hash are counted as `no_hash` and do not fail verification.
+Missing files, size or hash mismatches, blocked paths, read errors, and invalid
+project metadata produce a nonzero exit status; otherwise the exit status is zero.
+
+To repair same-size corrupt files, remove them and rerun mirror with the same
+selection:
+
+```sh
+snatchrs verify ./mirror --package packaging --remove-bad
+snatchrs mirror ./mirror --package packaging
+snatchrs verify ./mirror --package packaging
+```
+
+`--remove-bad` deletes only files with matching sizes and incorrect SHA256 values,
+updates affected Simple pages, and still exits nonzero to report the corruption.
+For a whole mirror, omit `--package` when verifying and use `mirror ./mirror --all`
+when repairing. Other problems require inspection; size mismatches and missing
+files can also be repaired by `mirror`.
+
+The atomic `verify-report.json` contains counts, bytes hashed, removals, and a
+mirror-relative `problems_path` pointing to `reports/verify-*/problems.jsonl`.
+That journal records each problem file and project metadata error. `--json`
+prints the report instead of the plain summary. Progress shows files checked and
+bytes hashed; `--no-progress` uses plain status lines and `--quiet` suppresses them.
 
 ## Serving the mirror
 
