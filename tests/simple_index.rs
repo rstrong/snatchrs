@@ -101,6 +101,9 @@ impl Server {
         }
     }
     fn run(&self, root: &Path, mode: &str) -> Output {
+        self.run_with(root, mode, &[])
+    }
+    fn run_with(&self, root: &Path, mode: &str, extra: &[&str]) -> Output {
         let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
             .args([mode])
             .args(if mode == "mirror" {
@@ -117,6 +120,7 @@ impl Server {
                 "--json",
                 "--quiet",
             ])
+            .args(extra)
             .env("NO_PROXY", "*")
             .env("no_proxy", "*")
             .output()
@@ -490,4 +494,100 @@ fn metadata_reports_journals_and_run_directories_are_readable_by_other_users() {
             .join(checked["unavailable_path"].as_str().unwrap()),
         0o644,
     );
+}
+
+#[test]
+fn report_retention_flags_counts_and_current_references_work_across_commands() {
+    fn plant(root: &Path, prefix: &str, years: &[u16]) {
+        for year in years {
+            let path = root.join(format!("reports/{prefix}{year}0101T000000Z-old"));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("details.jsonl"), b"{}\n").unwrap();
+        }
+    }
+    fn verify(root: &Path, keep: &str) -> serde_json::Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
+            .arg("verify")
+            .arg(root)
+            .args(["--keep-reports", keep, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+    let root = tempdir().unwrap();
+    let server = Server::start();
+    server.run(root.path(), "mirror");
+    for prefix in ["run-", "verify-"] {
+        plant(root.path(), prefix, &[1990, 1991, 1992]);
+    }
+    let checked: serde_json::Value = serde_json::from_slice(
+        &server
+            .run_with(root.path(), "check", &["--keep-reports", "1"])
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(checked["reports_pruned"], 5);
+    let checked_path = root.path().join(checked["packages_path"].as_str().unwrap());
+    assert!(checked_path.file_name().is_some());
+    assert!(
+        checked_path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("run-20")
+    );
+    plant(root.path(), "verify-", &[1980, 1981, 1982]);
+    let verified = verify(root.path(), "1");
+    assert_eq!(verified["reports_pruned"], 3);
+    let mirrored: serde_json::Value = serde_json::from_slice(
+        &server
+            .run_with(root.path(), "mirror", &["--keep-reports", "1"])
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(mirrored["inspection"]["reports_pruned"], 1);
+    for path in [
+        checked["packages_path"].as_str().unwrap(),
+        verified["problems_path"].as_str().unwrap(),
+        mirrored["inspection"]["packages_path"].as_str().unwrap(),
+    ] {
+        assert!(root.path().join(path).is_file(), "{path}");
+    }
+    plant(root.path(), "run-", &[1971, 1972]);
+    plant(root.path(), "verify-", &[1971, 1972]);
+    let before: Vec<_> = fs::read_dir(root.path().join("reports"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(verify(root.path(), "0")["reports_pruned"], 0);
+    assert!(before.iter().all(|path| path.is_dir()));
+    let plain = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
+        .arg("check")
+        .arg(root.path())
+        .args([
+            "--package",
+            "Example_Pkg",
+            "--metadata-url",
+            &format!("{}/simple/", server.base),
+            "--keep-reports",
+            "1",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("old report directories pruned"));
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("Pruned"));
 }

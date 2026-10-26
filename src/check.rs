@@ -55,6 +55,14 @@ pub struct CheckArgs {
     /// Metadata workers (1–32).
     #[arg(long, value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=32), help_heading = "Advanced")]
     metadata_concurrency: u16,
+    /// Retain N recent report directories per group; 0 keeps everything.
+    #[arg(
+        long,
+        default_value_t = 10,
+        value_name = "N",
+        help_heading = "Advanced"
+    )]
+    keep_reports: usize,
     /// Fetch fresh project metadata.
     #[arg(long, help_heading = "Advanced")]
     refresh: bool,
@@ -149,6 +157,7 @@ struct PackageError {
 struct CheckReport {
     mirror_root: PathBuf,
     stale_temp_files_removed: usize,
+    reports_pruned: usize,
     stopped: Option<String>,
     metadata_concurrency: usize,
     seed: Option<u64>,
@@ -309,6 +318,7 @@ fn run_inner(
     let mut dashboard = interactive.then(crate::progress::Dashboard::new);
     let layout = MirrorLayout::create(&args.mirror)?;
     let _lock = layout.lock()?;
+    let reports_pruned = snatchrs::cleanup::prune_reports(&layout.root, args.keep_reports);
     let client = IndexClient::with_attempts(attempts)?.with_interrupt(interrupt.clone());
     let metadata_url = args
         .metadata_url
@@ -408,6 +418,7 @@ fn run_inner(
     let mut report = CheckReport {
         mirror_root: PathBuf::from("."),
         stale_temp_files_removed: _lock.stale_temp_files_removed,
+        reports_pruned,
         stopped: None,
         metadata_concurrency: metadata_options.concurrency,
         seed,
@@ -497,6 +508,7 @@ fn run_inner(
     report.stopped = interrupt.is_interrupted().then(|| "Interrupted".into());
     report.stale_temp_files_removed += report.summary.stale_temp_files_removed;
     snatchrs::cleanup::announce(report.stale_temp_files_removed, quiet);
+    snatchrs::cleanup::announce_pruned(report.reports_pruned, quiet);
     journal.packages.get_ref().sync_all()?;
     journal.errors.sync()?;
     journal.unavailable.sync()?;
@@ -545,8 +557,9 @@ fn run_inner(
         )?;
         writeln!(
             stdout,
-            "{} files need downloading; no downloads performed",
-            report.summary.missing + report.summary.size_mismatch
+            "{} files need downloading; no downloads performed{}",
+            report.summary.missing + report.summary.size_mismatch,
+            snatchrs::cleanup::retention_summary(report.reports_pruned)
         )?;
     }
     stdout.flush()?;
@@ -734,6 +747,7 @@ fn run_pipeline(
         inspection.stopped = Some("Interrupted".into());
     }
     snatchrs::cleanup::announce(inspection.stale_temp_files_removed, quiet);
+    snatchrs::cleanup::announce_pruned(inspection.reports_pruned, quiet);
     downloads.progress.discovery.total_packages = inspection.checked
         + inspection.error_count
         + inspection.unavailable_count
@@ -829,12 +843,13 @@ fn run_pipeline(
     } else if ui.is_none() {
         writeln!(
             stdout,
-            "Downloaded {} files · {} failed · {} files with matching sizes · {} inspection errors · {} unavailable projects",
+            "Downloaded {} files · {} failed · {} files with matching sizes · {} inspection errors · {} unavailable projects{}",
             downloads.progress.downloaded,
             downloads.progress.failed,
             report.final_check.matching_size,
             inspection.error_count,
-            inspection.unavailable_count
+            inspection.unavailable_count,
+            snatchrs::cleanup::retention_summary(inspection.reports_pruned)
         )?;
     }
     stdout.flush()?;

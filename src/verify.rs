@@ -41,6 +41,14 @@ pub struct VerifyArgs {
     /// Remove same-size files with an incorrect SHA256.
     #[arg(long)]
     remove_bad: bool,
+    /// Retain N recent report directories per group; 0 keeps everything.
+    #[arg(
+        long,
+        default_value_t = 10,
+        value_name = "N",
+        help_heading = "Advanced"
+    )]
+    keep_reports: usize,
     /// Print the verification report as JSON.
     #[arg(long, help_heading = "Advanced")]
     json: bool,
@@ -62,6 +70,7 @@ enum State {
 #[derive(Default, Serialize)]
 struct VerifyReport {
     stale_temp_files_removed: usize,
+    reports_pruned: usize,
     stopped: Option<String>,
     projects: usize,
     files: usize,
@@ -419,6 +428,7 @@ pub fn run(
     ensure!(root.is_dir(), "Mirror is not a directory");
     let layout = MirrorLayout { root };
     let _lock = layout.lock()?;
+    let reports_pruned = snatchrs::cleanup::prune_reports(&layout.root, args.keep_reports);
     let reports = layout.root.join("reports");
     match fs::create_dir(&reports) {
         Ok(()) => {}
@@ -432,6 +442,7 @@ pub fn run(
     let mut problems = snatchrs::mirror::create_jsonl(&run.join("problems.jsonl"))?;
     let mut report = VerifyReport {
         stale_temp_files_removed: _lock.stale_temp_files_removed,
+        reports_pruned,
         problems_path: run.strip_prefix(&layout.root)?.join("problems.jsonl"),
         ..Default::default()
     };
@@ -612,6 +623,7 @@ pub fn run(
     }
     report.stopped = interrupt.is_interrupted().then(|| "Interrupted".into());
     snatchrs::cleanup::announce(report.stale_temp_files_removed, quiet);
+    snatchrs::cleanup::announce_pruned(report.reports_pruned, quiet);
     let path = layout.root.join("verify-report.json");
     write_json(&path, &report)?;
     let repair = if report.removed > 0 {
@@ -626,7 +638,7 @@ pub fn run(
     } else {
         writeln!(
             stdout,
-            "Verified {} projects, {} files · {} ok · {} no hash · {} missing · {} size mismatch · {} hash mismatch · {} blocked · {} read errors · {} project errors · {} hashed · {} removed{repair}",
+            "Verified {} projects, {} files · {} ok · {} no hash · {} missing · {} size mismatch · {} hash mismatch · {} blocked · {} read errors · {} project errors · {} hashed · {} removed{repair}{}",
             report.projects,
             report.files,
             report.ok,
@@ -638,7 +650,8 @@ pub fn run(
             report.error,
             report.project_errors,
             HumanBytes(report.bytes_hashed),
-            report.removed
+            report.removed,
+            snatchrs::cleanup::retention_summary(report.reports_pruned)
         )?;
     }
     stdout.flush()?;

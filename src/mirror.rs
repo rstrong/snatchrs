@@ -351,8 +351,12 @@ pub fn create_jsonl(path: &Path) -> Result<std::io::BufWriter<fs::File>> {
 }
 
 pub fn create_report_directory(reports: &Path, prefix: &str) -> Result<PathBuf> {
+    let prefix = format!(
+        "{prefix}{}-",
+        crate::cleanup::report_timestamp(std::time::SystemTime::now())
+    );
     let directory = tempfile::Builder::new()
-        .prefix(prefix)
+        .prefix(&prefix)
         .tempdir_in(reports)?;
     #[cfg(unix)]
     {

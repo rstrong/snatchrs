@@ -267,6 +267,32 @@ fn interrupt_aborts_stalled_download_saves_report_and_keeps_completed_files() {
         String::from_utf8_lossy(&output.stderr)
             .contains("Completed files are kept; rerun to continue.")
     );
+    let interrupted_journal = temp
+        .path()
+        .join(report["inspection"]["packages_path"].as_str().unwrap());
+    for year in [2000, 2001] {
+        let old = temp
+            .path()
+            .join(format!("reports/run-{year}0101T000000Z-old"));
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join("partial.jsonl"), b"{").unwrap();
+    }
+    let next = command(temp.path(), &server, "check")
+        .args(["--keep-reports", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    let next = serde_json::from_slice::<Value>(&next.stdout).unwrap();
+    assert_eq!(next["reports_pruned"], 2);
+    assert_eq!(next["error_count"], 0);
+    assert!(
+        interrupted_journal.exists(),
+        "The current mirror report still references this interrupted run"
+    );
 }
 #[test]
 fn second_signal_exits_immediately_and_next_run_sweeps_leftovers() {

@@ -383,9 +383,18 @@ the bounded result buffer must also fit in memory.
 Each run has its own detail directory with compact counts, problem files, and
 completed download outcomes. It references the shared `metadata/` cache rather
 than copying it; metadata describes the latest inspection, not a historical
-snapshot for each run. Earlier journal paths remain readable after subsequent
-runs. Completed and interrupted run directories are kept for inspection and can
-be removed when their reports are no longer needed. JSON files and JSONL journals
+snapshot for each run. New directories use UTC-sortable names such as
+`run-20261026T120000Z-<random>` and `verify-20261026T120000Z-<random>`.
+After locking, `check`, `mirror`, and `verify` keep the newest 10 directories in
+each group by default, then create the new run. Thus up to 11 ordinary directories
+per group remain. `--keep-reports N` changes that limit; `--keep-reports 0`
+disables pruning. Legacy names sort by modification time before timestamped runs.
+Directories referenced by the current check/mirror/verify reports are always
+preserved, as are symlinks and directories containing non-regular entries; those
+exceptions can leave more than N+1 directories. Unparseable current reports
+disable pruning for their group. Pruning is best-effort and counted in
+`reports_pruned` alongside `stale_temp_files_removed`. Older unreferenced journal
+paths may disappear after later runs. JSON files and JSONL journals
 are readable by other users (0644), and run/verify directories are traversable
 (0755), so a separate nginx user can read them. JSONL files may end
 with an incomplete line if the process is interrupted; only complete lines should
