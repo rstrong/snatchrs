@@ -78,7 +78,8 @@ unavailable-project handling.
 
 The main options are selection, `--seed`, `-j/--concurrency` (default 8), `--quiet`,
 and `--no-progress`. Less common controls are under **Advanced** in help:
-metadata workers default to 4 and attempts default to 3.
+metadata workers default to 4, attempts default to 3, and `--min-free` defaults to
+`1G` of space kept free on the mirror filesystem.
 
 In an interactive terminal, `snatchrs index` displays an animated dashboard:
 bytes read while decoding JSON, followed by a package progress bar, processed and
@@ -318,15 +319,30 @@ are never installed, imported, or extracted. A failed command can be rerun to sk
 completed files; partial downloads restart from zero. Interrupted processes may
 leave hidden temporary files, which are never treated as completed artifacts.
 
-Workers check and conservatively reserve disk space for active transfers,
-including replacements. Pending jobs do not reserve their future artifact size
-or block checking while waiting for a worker. Reservations are released after
-each attempt. Transfer/storage failures are recorded per file. A queue-spool
-write failure stops further discovery, drains accepted jobs, and is recorded in
-the final report. Individual metadata failures are recorded and
-discovery continues. A filesystem lock prevents simultaneous
-`check`/`mirror` commands from using the same root. Existing files are checked by
-size only; their hashes are not revalidated on subsequent runs.
+Workers reserve space for active transfers, including replacements, while always
+leaving `--min-free SIZE` free (default `1G`). Sizes accept plain bytes or binary
+`K`, `M`, `G`, `T` suffixes, case-insensitively, optionally followed by `B` or `iB`;
+for example `512M`, `1GiB`, or `2t`. `--min-free 0` disables the free-space margin.
+Pending jobs do not reserve future artifact sizes. A worker waits when another
+active reservation is preventing its file from fitting, then rechecks free space
+when that reservation is released.
+
+If a file cannot fit alone, or a write reports an exhausted filesystem/quota, the
+run stops discovery and stops taking new jobs. Transfers already in progress may
+finish. The triggering file is recorded as a failure; queued files that never
+started are counted as `not_attempted`, rather than generating thousands of failed
+outcomes. The stop message identifies the path, required bytes, available bytes,
+and `--min-free`, along with unattempted files and uninspected projects. Free space
+and rerun: completed distributions are kept and partial files are cleaned up.
+
+A conflicting package, invalid download path, or package size overflow is recorded
+in the package-error journal and discovery continues. A closed/broken queue or
+spool-write failure stops the whole producer and is recorded once as a queue-wide
+error. Active downloads finish; untouched queued jobs are not attempted. The final
+report is still saved on handled stop/error paths. Report persistence itself
+requires a writable mirror filesystem. A filesystem lock prevents simultaneous
+`check`, `mirror`, and `simple` commands from using the same root. Existing files
+are checked by size only; their hashes are not revalidated on subsequent runs.
 
 In one terminal display, progress includes packages checked and the current name,
 metadata errors, unavailable projects, files discovered, queued/active downloads, byte counts, transfer
@@ -339,12 +355,22 @@ For noninteractive runs, concise progress is logged to stderr every five seconds
 Saved files include:
 
 - `check-report.json`: `selection`, seed, inspection counters, `error_count`, and paths to detail files; written when discovery ends. `selection` is `all`, `packages`, `packages_file`, or `sample`. `selected_packages` contains normalized names in selection order for the latter three modes and is absent for `all`; `packages_file` records the supplied input path only for that mode.
-- `mirror-progress.json`: periodically updated checking, worker, and transfer progress.
+- `mirror-progress.json`: periodically updated checking, worker, and transfer progress. `not_attempted` counts queued files never started; `stopped` holds the run-wide stop reason or null.
 - `mirror-report.json`: inspection summary, download counters, `downloads.outcomes_path`, and final size checks. The
   `simple_index` object records `projects`, `files_linked`, `files_skipped`, and
   `projects_removed`. The first three describe pages generated during the run;
   `projects_removed` counts obsolete pages pruned in the final pass of a `--all`
-  mirror run, including runs with per-project failures.
+  mirror run, including runs with per-project failures. `page_errors` counts all
+  page-generation failures; `errors` lists the first 100 `{name, error}` records.
+  A failed project page does not prevent other pages, the root index, or the final
+  report from being written. `downloads.min_free` records the configured margin
+  in bytes; `downloads.progress` includes `not_attempted` and `stopped`.
+The inspection summary also records `checked` (successful local inspections),
+`error_count` (package failures), `unavailable_count`, `not_inspected`, and
+`queue_error` (a run-wide reason or null). The first four counters partition the
+selection. Queue-wide errors appear once in the error journal with name
+`<queue>` and do not inflate the package-error count.
+
 - `reports/run-*/checked-packages.jsonl`: one checked package per line, including metadata and initial file states (`inspection.packages_path`).
 - `reports/run-*/package-errors.jsonl`: one metadata/queue error per line (`inspection.errors_path`).
 - `reports/run-*/unavailable-projects.jsonl`: one project metadata 404 per line, with name, requested metadata URL, `status: "not_found"`, and `http_status: 404` (`inspection.unavailable_path`).
@@ -366,8 +392,9 @@ and can be removed when their reports are no longer needed. JSONL files may end
 with an incomplete line if the process is interrupted; only complete lines should
 be consumed from an interrupted run.
 
-Any metadata errors, failed downloads, missing/wrong-sized files, or blocked paths
-produce a nonzero exit code after the final report is saved. Reports use atomic
+Metadata errors, failed downloads, missing/wrong-sized files, blocked paths,
+queue stops, and page-generation failures produce a nonzero exit code after the
+final report is saved. Reports use atomic
 replacement. Mirror runs also publish a static HTML Simple Index usable by pip
 and uv; see [Serving the mirror](#serving-the-mirror).
 
@@ -538,14 +565,19 @@ artifacts, run:
 ```
 
 This takes the mirror lock, reads one `metadata/*.json` file at a time, and prints
-counts of projects written, files linked, and files skipped as not present. It
+counts of projects written, files linked, files skipped as not present, and
+obsolete project pages removed. It
 uses local metadata without network access. Root-index generation scans existing
 `simple/<name>/index.html` pages, so earlier sampled projects remain discoverable.
 A metadata 404 during `mirror` removes that project's page and root-index entry,
 while retaining its local artifacts. `check` does not create, update, or remove
-pages. If metadata itself was manually removed, remove its obsolete project page
-too before rebuilding the root index; the standalone command does not infer
-project deletion from absent metadata.
+pages. Standalone `simple` treats `metadata/` as authoritative: if a project's
+metadata file is absent (including after a `check` sees a 404), its obsolete page
+is removed, while its distributions under `packages/` remain untouched. A file
+that exists but is corrupt or unreadable keeps its old page. Such metadata/page
+errors are listed and skipped while other projects and the root index are rebuilt;
+the command then exits nonzero. Error details printed by `simple` and stored under
+`simple_index.errors` are capped at 100, while the error count stays exact.
 
 A minimal [nginx](https://nginx.org/en/docs/http/ngx_http_core_module.html#try_files)
 server block exposes only the two public trees:

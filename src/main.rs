@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use snatchrs::{DEFAULT_INDEX_URL, IndexClient, PackageIndex};
 use url::Url;
@@ -71,10 +71,14 @@ fn run(cli: Cli) -> Result<()> {
             let mut stdout = io::BufWriter::new(io::stdout().lock());
             writeln!(
                 stdout,
-                "Simple index: {} projects written · {} files linked · {} files skipped as not present",
-                summary.projects, summary.files_linked, summary.files_skipped
+                "Simple index: {} projects written · {} files linked · {} files skipped as not present · {} projects removed",
+                summary.projects,
+                summary.files_linked,
+                summary.files_skipped,
+                summary.projects_removed
             )?;
             stdout.flush()?;
+            ensure!(summary.page_errors == 0, "{}", summary.failure_message());
             return Ok(());
         }
         Command::Index {

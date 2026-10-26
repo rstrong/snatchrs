@@ -146,7 +146,7 @@ fn mirrored_links_resolve_locally_and_match_their_hashes_then_regenerate_and_rem
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         report["simple_index"],
-        serde_json::json!({"projects":1,"files_linked":2,"files_skipped":0,"projects_removed":0})
+        serde_json::json!({"projects":1,"files_linked":2,"files_skipped":0,"projects_removed":0,"page_errors":0,"errors":[]})
     );
     let root_page = fs::read_to_string(root.path().join("simple/index.html")).unwrap();
     let project_page =
@@ -218,7 +218,7 @@ fn mirrored_links_resolve_locally_and_match_their_hashes_then_regenerate_and_rem
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["inspection"]["unavailable_count"], 1);
     assert_eq!(report["simple_index"]["projects"], 0);
-    assert!(!root.path().join("simple/example-pkg/index.html").exists());
+    assert!(!root.path().join("simple/example-pkg").exists());
     assert!(hrefs(&fs::read_to_string(root.path().join("simple/index.html")).unwrap()).is_empty());
     for filename in FILENAMES {
         assert_eq!(

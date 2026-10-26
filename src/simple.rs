@@ -15,19 +15,54 @@ use crate::{
     normalize_name,
 };
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PageError {
+    pub name: String,
+    pub error: String,
+}
+
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
 pub struct SimpleSummary {
     pub projects: usize,
     pub files_linked: usize,
     pub files_skipped: usize,
     pub projects_removed: usize,
+    pub page_errors: usize,
+    pub errors: Vec<PageError>,
 }
 impl SimpleSummary {
+    pub fn record_error(&mut self, name: impl Into<String>, error: anyhow::Error) {
+        self.page_errors += 1;
+        if self.errors.len() < 100 {
+            self.errors.push(PageError {
+                name: name.into(),
+                error: format!("{error:#}"),
+            });
+        }
+    }
+    pub fn failure_message(&self) -> String {
+        format!(
+            "{} index/page errors (showing {}): {}",
+            self.page_errors,
+            self.errors.len(),
+            self.errors
+                .iter()
+                .map(|error| format!("{}: {}", error.name, error.error))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    }
     pub fn add(&mut self, page: Self) {
         self.projects += page.projects;
         self.files_linked += page.files_linked;
         self.files_skipped += page.files_skipped;
         self.projects_removed += page.projects_removed;
+        self.page_errors += page.page_errors;
+        self.errors.extend(
+            page.errors
+                .into_iter()
+                .take(100usize.saturating_sub(self.errors.len())),
+        );
     }
 }
 
@@ -183,11 +218,8 @@ pub fn project_names(root: &Path) -> Result<Vec<String>> {
     for entry in fs::read_dir(&simple)? {
         let entry = entry?;
         let kind = entry.file_type()?;
-        ensure!(
-            !kind.is_symlink(),
-            "Symlink in Simple Index: {}",
-            entry.path().display()
-        );
+        // A broken/symlinked project must not prevent indexing healthy pages.
+        // Never traverse links or include them in the public root index.
         if !kind.is_dir() {
             continue;
         }
@@ -200,14 +232,15 @@ pub fn project_names(root: &Path) -> Result<Vec<String>> {
         }
         match fs::symlink_metadata(entry.path().join("index.html")) {
             Ok(metadata) => {
-                ensure!(
-                    metadata.file_type().is_file(),
-                    "Expected a regular project page in {}",
-                    entry.path().display()
-                );
-                projects.push(name);
+                if metadata.file_type().is_file() {
+                    projects.push(name);
+                }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -231,7 +264,7 @@ pub fn write_root_index(root: &Path) -> Result<usize> {
     Ok(projects.len())
 }
 
-/// Remove only a project's HTML page. Missing pages are already removed.
+/// Remove a project's HTML page and its directory if empty; retain other files.
 pub fn remove_project_page(root: &Path, name: &str) -> Result<()> {
     let name = normalize_name(name)?;
     let simple = resolve_path(root, Path::new("simple"))?;
@@ -243,8 +276,20 @@ pub fn remove_project_page(root: &Path, name: &str) -> Result<()> {
         return Ok(());
     }
     match fs::remove_file(project.join("index.html")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::remove_dir(project) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -255,8 +300,14 @@ pub fn regenerate(root: &Path) -> Result<SimpleSummary> {
     let metadata_dir = resolve_path(root, Path::new("metadata"))?;
     create_directory(&metadata_dir)?;
     let mut summary = SimpleSummary::default();
-    for entry in fs::read_dir(metadata_dir)? {
-        let entry = entry?;
+    for entry in fs::read_dir(&metadata_dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                summary.record_error("<metadata>", error.into());
+                continue;
+            }
+        };
         if entry
             .path()
             .extension()
@@ -264,22 +315,53 @@ pub fn regenerate(root: &Path) -> Result<SimpleSummary> {
         {
             continue;
         }
-        ensure!(
-            entry.file_type()?.is_file(),
-            "Expected a regular metadata file: {}",
-            entry.path().display()
-        );
-        let metadata: PackageMetadata = serde_json::from_reader(BufReader::new(File::open(
-            entry.path(),
-        )?))
-        .with_context(|| format!("Invalid project metadata in {}", entry.path().display()))?;
-        ensure!(
-            entry.file_name() == format!("{}.json", metadata.package.normalized_name).as_str(),
-            "Metadata filename does not match project name"
-        );
-        summary.add(write_project_page(root, &metadata)?);
+        let name = entry
+            .path()
+            .file_stem()
+            .context("Metadata has no project name")?
+            .to_string_lossy()
+            .into_owned();
+        let page = (|| -> Result<SimpleSummary> {
+            ensure!(
+                entry.file_type()?.is_file(),
+                "Expected a regular metadata file: {}",
+                entry.path().display()
+            );
+            let metadata: PackageMetadata = serde_json::from_reader(BufReader::new(File::open(
+                entry.path(),
+            )?))
+            .with_context(|| format!("Invalid project metadata in {}", entry.path().display()))?;
+            ensure!(
+                entry.file_name() == format!("{}.json", metadata.package.normalized_name).as_str(),
+                "Metadata filename does not match project name"
+            );
+            write_project_page(root, &metadata)
+        })();
+        match page {
+            Ok(page) => summary.add(page),
+            Err(error) => summary.record_error(name, error),
+        }
     }
-    write_root_index(root)?;
+    match project_names(root) {
+        Ok(names) => {
+            for name in names {
+                match fs::symlink_metadata(metadata_dir.join(format!("{name}.json"))) {
+                    Ok(_) => {} // Existing but corrupt/unreadable metadata keeps its old page.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        match remove_project_page(root, &name) {
+                            Ok(()) => summary.projects_removed += 1,
+                            Err(error) => summary.record_error(name, error),
+                        }
+                    }
+                    Err(error) => summary.record_error(name, error.into()),
+                }
+            }
+        }
+        Err(error) => summary.record_error("<root>", error),
+    }
+    if let Err(error) = write_root_index(root) {
+        summary.record_error("<root>", error);
+    }
     Ok(summary)
 }
 
@@ -326,6 +408,20 @@ mod tests {
     }
 
     #[test]
+    fn page_errors_are_counted_exactly_with_bounded_details_and_output() {
+        let mut summary = SimpleSummary::default();
+        for number in 0..150 {
+            summary.record_error(format!("pkg-{number}"), anyhow::anyhow!("page failure"));
+        }
+        assert_eq!(summary.page_errors, 150);
+        assert_eq!(summary.errors.len(), 100);
+        let message = summary.failure_message();
+        assert!(message.contains("150 index/page errors"));
+        assert!(message.contains("pkg-99:"));
+        assert!(!message.contains("pkg-100:"));
+    }
+
+    #[test]
     fn escapes_html_and_encodes_single_utf8_url_segments() {
         assert_eq!(escape_html("<&>\"'"), "&lt;&amp;&gt;&quot;&#39;");
         assert_eq!(
@@ -367,6 +463,7 @@ mod tests {
                 files_linked: 2,
                 files_skipped: 2,
                 projects_removed: 0,
+                ..Default::default()
             }
         );
         let html = fs::read_to_string(root.path().join("simple/pkg/index.html")).unwrap();
@@ -440,12 +537,27 @@ mod tests {
         remove_project_page(root.path(), "pkg").unwrap();
         assert_eq!(write_root_index(root.path()).unwrap(), 0);
         assert_eq!(fs::read(artifact).unwrap(), b"data");
-        assert!(!root.path().join("simple/pkg/index.html").exists());
+        assert!(!root.path().join("simple/pkg").exists());
         assert!(
             !fs::read_to_string(root.path().join("simple/index.html"))
                 .unwrap()
                 .contains("href=\"pkg/\"")
         );
+    }
+
+    #[test]
+    fn removing_a_page_retains_nonempty_project_directories() {
+        let root = tempdir().unwrap();
+        let data = metadata(root.path(), &[]);
+        write_project_page(root.path(), &data).unwrap();
+        let extra = root.path().join("simple/pkg/notes.txt");
+        fs::write(&extra, b"keep").unwrap();
+        remove_project_page(root.path(), "pkg").unwrap();
+        assert!(!root.path().join("simple/pkg/index.html").exists());
+        assert_eq!(fs::read(&extra).unwrap(), b"keep");
+        fs::remove_file(extra).unwrap();
+        remove_project_page(root.path(), "pkg").unwrap();
+        assert!(!root.path().join("simple/pkg").exists());
     }
 
     #[test]
@@ -480,6 +592,7 @@ mod tests {
                 files_linked: 1,
                 files_skipped: 0,
                 projects_removed: 0,
+                ..Default::default()
             }
         );
         fs::remove_file(root.path().join("packages/pkg/pkg.whl")).unwrap();
@@ -490,6 +603,7 @@ mod tests {
                 files_linked: 0,
                 files_skipped: 1,
                 projects_removed: 0,
+                ..Default::default()
             }
         );
         assert!(
@@ -534,7 +648,7 @@ mod tests {
         fs::create_dir(root.path().join("simple")).unwrap();
         symlink(outside.path(), root.path().join("simple/pkg")).unwrap();
         assert!(write_project_page(root.path(), &data).is_err());
-        assert!(write_root_index(root.path()).is_err());
+        assert_eq!(write_root_index(root.path()).unwrap(), 0);
         assert!(remove_project_page(root.path(), "pkg").is_err());
         fs::remove_file(root.path().join("simple/pkg")).unwrap();
         fs::remove_dir(root.path().join("packages/pkg")).unwrap();

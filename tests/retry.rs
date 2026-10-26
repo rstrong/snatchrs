@@ -156,6 +156,7 @@ fn options(attempts: u32) -> DownloadOptions {
     DownloadOptions {
         concurrency: 1,
         attempts,
+        min_free: 0,
         read_timeout: Duration::from_secs(3),
     }
 }

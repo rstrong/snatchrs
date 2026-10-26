@@ -56,15 +56,17 @@ impl DownloadDashboard {
         } else {
             "checking"
         };
-        self.checking.set_message(format!(
-            "{phase} · {} · {} metadata/queue errors · {} unavailable projects",
-            progress.discovery.current_package,
-            progress.discovery.errors,
-            progress.discovery.unavailable
-        ));
+        self.checking
+            .set_message(progress.stopped.clone().unwrap_or_else(|| {
+                format!(
+                    "{phase} · {} · {} metadata/queue errors · {} unavailable projects",
+                    progress.discovery.current_package,
+                    progress.discovery.errors,
+                    progress.discovery.unavailable
+                )
+            }));
         self.overall.set_length(progress.total_files as u64);
-        self.overall
-            .set_position((progress.downloaded + progress.failed) as u64);
+        self.overall.set_position(progress.completed_files() as u64);
         let active = progress
             .workers
             .iter()
@@ -77,15 +79,15 @@ impl DownloadDashboard {
             .count();
         let queued = progress
             .total_files
-            .saturating_sub(progress.downloaded + progress.failed + active + retrying);
+            .saturating_sub(progress.completed_files() + active + retrying);
         let total = if progress.discovery.finished {
             "final total"
         } else {
             "total still growing"
         };
         self.overall.set_message(format!(
-            "{queued} queued · {active} active · {retrying} retrying · {} failed · {total}",
-            progress.failed
+            "{queued} queued · {active} active · {retrying} retrying · {} failed · {} not attempted · {total}",
+            progress.failed, progress.not_attempted
         ));
         self.bytes.set_length(progress.total_bytes);
         let inflight: u64 = progress
@@ -126,13 +128,14 @@ impl DownloadDashboard {
         self.checking.finish_and_clear();
         self.overall.set_style(style("{msg}"));
         self.overall.finish_with_message(format!(
-            "Checked {}/{} packages · {} metadata/queue errors · {} unavailable projects\nDownloaded {} files · {} failed · {:.2} MiB verified in {:.1}s",
+            "Checked {}/{} packages · {} metadata/queue errors · {} unavailable projects\nDownloaded {} files · {} failed · {} not attempted · {:.2} MiB verified in {:.1}s",
             progress.discovery.checked_packages,
             progress.discovery.total_packages,
             progress.discovery.errors,
             progress.discovery.unavailable,
             progress.downloaded,
             progress.failed,
+            progress.not_attempted,
             progress.verified_bytes as f64 / 1_048_576.0,
             progress.elapsed_seconds
         ));

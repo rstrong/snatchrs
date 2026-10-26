@@ -144,7 +144,7 @@ struct PackageError {
     error: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct CheckReport {
     mirror_root: PathBuf,
     metadata_concurrency: usize,
@@ -158,6 +158,9 @@ struct CheckReport {
     packages_path: PathBuf,
     errors_path: PathBuf,
     error_count: usize,
+    checked: usize,
+    not_inspected: usize,
+    queue_error: Option<String>,
     unavailable_path: PathBuf,
     unavailable_count: usize,
 }
@@ -182,8 +185,8 @@ fn record_error(
     journal: &mut InspectionJournal,
     error: PackageError,
 ) -> Result<()> {
-    append_jsonl(&mut journal.errors, &error)?;
     report.error_count += 1;
+    append_jsonl(&mut journal.errors, &error)?;
     Ok(())
 }
 
@@ -193,6 +196,7 @@ fn record_unavailable(
     name: &str,
     metadata_url: Url,
 ) -> Result<()> {
+    report.unavailable_count += 1;
     append_jsonl(
         &mut journal.unavailable,
         &serde_json::json!({
@@ -200,7 +204,6 @@ fn record_unavailable(
             "metadata_url": metadata_url,
         }),
     )?;
-    report.unavailable_count += 1;
     Ok(())
 }
 
@@ -223,6 +226,9 @@ pub struct MirrorArgs {
     /// Download workers (1–64).
     #[arg(short = 'j', long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
     concurrency: u16,
+    /// Free space to keep (binary units).
+    #[arg(long, value_name = "SIZE", default_value = "1G", value_parser = snatchrs::download::parse_size, help_heading = "Advanced")]
+    min_free: u64,
 }
 
 pub fn run_mirror(args: MirrorArgs, quiet: bool, no_progress: bool, attempts: u32) -> Result<()> {
@@ -233,6 +239,7 @@ pub fn run_mirror(args: MirrorArgs, quiet: bool, no_progress: bool, attempts: u3
         Some(snatchrs::download::DownloadOptions {
             concurrency: usize::from(args.concurrency),
             attempts,
+            min_free: args.min_free,
             ..Default::default()
         }),
         attempts,
@@ -361,6 +368,9 @@ fn run_inner(
         packages_path,
         errors_path,
         error_count: 0,
+        checked: 0,
+        not_inspected: 0,
+        queue_error: None,
         unavailable_path,
         unavailable_count: 0,
     };
@@ -395,6 +405,7 @@ fn run_inner(
         |name, result| {
             match result {
                 Ok(MetadataOutcome::Available(metadata)) => {
+                    report.checked += 1;
                     let checked = check_package(&layout.root, *metadata, &mut report.summary);
                     append_jsonl(&mut journal.packages, &checked)?;
                 }
@@ -509,6 +520,7 @@ struct MirrorReport<'a> {
 #[derive(Serialize)]
 struct MirrorDownloads<'a> {
     concurrency: usize,
+    min_free: u64,
     progress: &'a snatchrs::download::DownloadProgress,
     outcomes_path: PathBuf,
 }
@@ -539,7 +551,18 @@ fn run_pipeline(
         .parent()
         .context("Missing run directory")?
         .join("download-outcomes.jsonl");
-    let mut outcomes_file = BufWriter::new(File::create(layout.root.join(&outcomes_path))?);
+    let (mut outcomes_file, outcome_open_error) =
+        match File::create(layout.root.join(&outcomes_path)) {
+            Ok(file) => (Some(BufWriter::new(file)), None),
+            Err(error) => (
+                None,
+                Some(format!("Cannot open download outcomes: {error}")),
+            ),
+        };
+    let mut fallback_inspection = inspection.clone();
+    fallback_inspection.not_inspected = packages.len();
+    let mut finished_inspection = None;
+    let mut latest_progress = snatchrs::download::DownloadProgress::default();
     let mut ui = crate::interactive(quiet, no_progress, json)
         .then(|| crate::download_ui::DownloadDashboard::new(options.concurrency));
     let mut checkpoint = Instant::now()
@@ -547,26 +570,38 @@ fn run_pipeline(
         .unwrap_or_else(Instant::now);
     let mut log_time = Instant::now();
     let mut checkpoint_error = None;
-    let (inspection, downloads) = snatchrs::download::download_stream_to(
+    let mut stop_announced = false;
+    let downloaded = snatchrs::download::download_stream_to(
         &layout.root,
         options,
         |queue| {
-            inspect_stream(
-                queue,
-                layout,
-                client,
-                metadata_options,
-                packages,
-                (inspection, journal),
-            )
+            let report = if let Some(reason) = &outcome_open_error {
+                let mut report = inspection;
+                let mut journal = journal;
+                report.not_inspected = packages.len();
+                stop_inspection(queue, &mut report, &mut journal, reason.clone());
+                report
+            } else {
+                inspect_stream(
+                    queue,
+                    layout,
+                    client,
+                    metadata_options,
+                    packages,
+                    (inspection, journal),
+                )?
+            };
+            finished_inspection = Some(report);
+            Ok(())
         },
         |progress| {
+            latest_progress = progress.clone();
             if let Some(ui) = ui.as_mut() {
                 ui.update(progress);
             }
             if checkpoint.elapsed() >= Duration::from_secs(1)
                 || (progress.discovery.finished
-                    && progress.downloaded + progress.failed == progress.total_files)
+                    && progress.completed_files() == progress.total_files)
             {
                 if let Err(error) = write_json(&layout.root.join("mirror-progress.json"), progress)
                 {
@@ -574,7 +609,19 @@ fn run_pipeline(
                 }
                 checkpoint = Instant::now();
             }
-            if ui.is_none() && !quiet && log_time.elapsed() >= Duration::from_secs(5) {
+            if let Some(reason) = &progress.stopped
+                && ui.is_none()
+                && !quiet
+                && !stop_announced
+            {
+                eprintln!("Stopped: {reason}");
+                stop_announced = true;
+            }
+            if progress.stopped.is_none()
+                && ui.is_none()
+                && !quiet
+                && log_time.elapsed() >= Duration::from_secs(5)
+            {
                 eprintln!(
                     "Checked {}/{} packages · downloaded {}/{} discovered files · {} failed · {} unavailable projects · {:.1} MiB transferred",
                     progress.discovery.checked_packages,
@@ -588,40 +635,100 @@ fn run_pipeline(
                 log_time = Instant::now();
             }
         },
-        |outcome| append_jsonl(&mut outcomes_file, outcome),
-    )?;
-    outcomes_file.get_ref().sync_all()?;
+        |outcome| {
+            append_jsonl(
+                outcomes_file
+                    .as_mut()
+                    .context("Download outcomes unavailable")?,
+                outcome,
+            )
+        },
+    );
+    let mut inspection = finished_inspection.unwrap_or(fallback_inspection);
+    let mut downloads = match downloaded {
+        Ok(((), downloads)) => downloads,
+        Err(error) => {
+            let reason = format!("{error:#}");
+            inspection.queue_error.get_or_insert(reason.clone());
+            latest_progress.stopped.get_or_insert(reason);
+            latest_progress.not_attempted = latest_progress
+                .total_files
+                .saturating_sub(latest_progress.downloaded + latest_progress.failed);
+            snatchrs::download::DownloadReport {
+                concurrency: options.concurrency,
+                min_free: options.min_free,
+                progress: latest_progress,
+                outcomes: Vec::new(),
+            }
+        }
+    };
+    if let Some(file) = &outcomes_file
+        && let Err(error) = file.get_ref().sync_all()
+    {
+        let reason = format!("Cannot sync download outcomes: {error}");
+        inspection.queue_error.get_or_insert(reason.clone());
+        downloads.progress.stopped.get_or_insert(reason);
+    }
+    downloads.progress.discovery.total_packages = inspection.checked
+        + inspection.error_count
+        + inspection.unavailable_count
+        + inspection.not_inspected;
+    downloads.progress.discovery.checked_packages =
+        inspection.checked + inspection.error_count + inspection.unavailable_count;
+    downloads.progress.discovery.finished = true;
+    if let Err(error) = write_json(
+        &layout.root.join("mirror-progress.json"),
+        &downloads.progress,
+    ) {
+        checkpoint_error = Some(format!("{error:#}"));
+    }
     if let Some(ui) = &ui {
         ui.finish(&downloads.progress);
     }
     let mut final_check = CheckSummary::default();
     let mut simple_index = snatchrs::simple::SimpleSummary::default();
-    visit_packages(&layout.root.join(&inspection.packages_path), |package| {
-        simple_index.add(snatchrs::simple::write_project_page(
-            &layout.root,
-            &package.metadata,
-        )?);
+    if let Err(error) = visit_packages(&layout.root.join(&inspection.packages_path), |package| {
+        match snatchrs::simple::write_project_page(&layout.root, &package.metadata) {
+            Ok(page) => simple_index.add(page),
+            Err(error) => {
+                simple_index.record_error(package.metadata.package.normalized_name.clone(), error)
+            }
+        }
         check_package(&layout.root, package.metadata, &mut final_check);
         Ok(())
-    })?;
+    }) {
+        simple_index.record_error("<inspection>", error);
+    }
     // Reaching the final pass means the root listing was fetched completely.
     // Per-project failures do not weaken its authority about deleted projects.
     if let Some(names) = authoritative_names {
-        for name in snatchrs::simple::project_names(&layout.root)? {
-            if !names.contains(&name) {
-                layout.invalidate_metadata(&name)?;
-                snatchrs::simple::remove_project_page(&layout.root, &name)?;
-                simple_index.projects_removed += 1;
+        match snatchrs::simple::project_names(&layout.root) {
+            Ok(projects) => {
+                for name in projects {
+                    if !names.contains(&name) {
+                        let removed = layout.invalidate_metadata(&name).and_then(|()| {
+                            snatchrs::simple::remove_project_page(&layout.root, &name)
+                        });
+                        match removed {
+                            Ok(()) => simple_index.projects_removed += 1,
+                            Err(error) => simple_index.record_error(name, error),
+                        }
+                    }
+                }
             }
+            Err(error) => simple_index.record_error("<root>", error),
         }
     }
-    snatchrs::simple::write_root_index(&layout.root)?;
+    if let Err(error) = snatchrs::simple::write_root_index(&layout.root) {
+        simple_index.record_error("<root>", error);
+    }
     let report = MirrorReport {
         final_check,
         simple_index,
         inspection: &inspection,
         downloads: MirrorDownloads {
             concurrency: downloads.concurrency,
+            min_free: downloads.min_free,
             progress: &downloads.progress,
             outcomes_path,
         },
@@ -647,18 +754,33 @@ fn run_pipeline(
         )?;
     }
     stdout.flush()?;
+    if let Some(reason) = &downloads.progress.stopped {
+        let stopped = if stop_announced {
+            "Stopped".to_owned()
+        } else {
+            format!("Stopped: {reason}")
+        };
+        anyhow::bail!(
+            "{stopped}. {} queued files were not attempted and {} projects were not inspected. Free space and rerun; completed files are kept.",
+            downloads.progress.not_attempted,
+            inspection.not_inspected
+        );
+    }
     ensure!(
         inspection.error_count == 0
+            && inspection.queue_error.is_none()
             && downloads.progress.failed == 0
+            && report.simple_index.page_errors == 0
             && report.final_check.blocked == 0
             && report.final_check.missing == 0
             && report.final_check.size_mismatch == 0,
-        "Mirror incomplete: {} inspection errors, {} failed downloads, {} missing, {} wrong-sized, {} blocked; see {}",
+        "Mirror incomplete: {} inspection errors, {} failed downloads, {} missing, {} wrong-sized, {} blocked, {} page errors; see {}",
         inspection.error_count,
         downloads.progress.failed,
         report.final_check.missing,
         report.final_check.size_mismatch,
         report.final_check.blocked,
+        report.simple_index.page_errors,
         path.display()
     );
     ensure!(
@@ -689,6 +811,27 @@ fn discovery(
     }
 }
 
+fn stop_inspection(
+    queue: &snatchrs::download::DownloadQueue,
+    report: &mut CheckReport,
+    journal: &mut InspectionJournal,
+    reason: String,
+) {
+    if report.queue_error.is_none() {
+        report.queue_error = Some(reason.clone());
+        // An exhausted filesystem may also reject this journal append. Keep
+        // the reason in the in-memory summary so saving the report is attempted.
+        let _ = append_jsonl(
+            &mut journal.errors,
+            &PackageError {
+                name: "<queue>".into(),
+                error: reason.clone(),
+            },
+        );
+    }
+    queue.stop(reason);
+}
+
 fn inspect_stream(
     queue: &mut snatchrs::download::DownloadQueue,
     layout: &MirrorLayout,
@@ -699,60 +842,102 @@ fn inspect_stream(
 ) -> Result<CheckReport> {
     let (mut report, mut journal) = inspection;
     let total = packages.len();
-    queue.discovery(discovery(&report, total, 0, ""))?;
     let mut completed = 0;
-    parallel_metadata(
-        packages,
-        client,
-        layout,
-        &metadata_options,
-        |name, result| {
-            let mut stop = false;
-            match result {
-                Ok(MetadataOutcome::Available(metadata)) => {
-                    let checked = check_package(&layout.root, *metadata, &mut report.summary);
-                    let tasks = snatchrs::download::build_tasks(std::slice::from_ref(&checked));
-                    append_jsonl(&mut journal.packages, &checked)?;
-                    let queued = tasks.and_then(|tasks| {
-                        for task in tasks {
-                            queue.enqueue(task)?;
+    let inspected = (|| -> Result<()> {
+        queue.discovery(discovery(&report, total, 0, ""))?;
+        parallel_metadata(
+            packages,
+            client,
+            layout,
+            &metadata_options,
+            |name, result| {
+                if let Some(reason) = queue.stop_reason() {
+                    stop_inspection(queue, &mut report, &mut journal, reason);
+                    return Ok(false);
+                }
+                let classified = report.checked + report.error_count + report.unavailable_count;
+                let handled = (|| -> Result<()> {
+                    match result {
+                        Ok(MetadataOutcome::Available(metadata)) => {
+                            let checked =
+                                check_package(&layout.root, *metadata, &mut report.summary);
+                            let tasks =
+                                snatchrs::download::build_tasks(std::slice::from_ref(&checked));
+                            append_jsonl(&mut journal.packages, &checked)?;
+                            let queued = tasks.and_then(|tasks| {
+                                for task in tasks {
+                                    queue.enqueue(task)?;
+                                }
+                                Ok(())
+                            });
+                            match queued {
+                                Ok(()) => report.checked += 1,
+                                Err(error)
+                                    if error
+                                        .downcast_ref::<snatchrs::download::QueueUnavailable>()
+                                        .is_some() =>
+                                {
+                                    report.checked += 1;
+                                    return Err(error);
+                                }
+                                Err(error) => record_error(
+                                    &mut report,
+                                    &mut journal,
+                                    PackageError {
+                                        name: name.clone(),
+                                        error: format!("Failed to queue downloads: {error:#}"),
+                                    },
+                                )?,
+                            }
                         }
-                        Ok(())
-                    });
-                    if let Err(error) = queued {
-                        record_error(
+                        Ok(MetadataOutcome::NotFound { metadata_url }) => {
+                            snatchrs::simple::remove_project_page(&layout.root, &name)?;
+                            record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
+                        }
+                        Err(error) => record_error(
                             &mut report,
                             &mut journal,
                             PackageError {
                                 name: name.clone(),
-                                error: format!("Failed to queue downloads: {error:#}"),
+                                error: format!("{error:#}"),
                             },
-                        )?;
-                        stop = true;
+                        )?,
                     }
+                    Ok(())
+                })();
+                completed += 1;
+                if let Err(error) = handled {
+                    if report.checked + report.error_count + report.unavailable_count == classified
+                    {
+                        report.checked += 1;
+                    }
+                    stop_inspection(queue, &mut report, &mut journal, format!("{error:#}"));
+                    let _ = queue.discovery(discovery(&report, total, completed, &name));
+                    return Ok(false);
                 }
-                Ok(MetadataOutcome::NotFound { metadata_url }) => {
-                    snatchrs::simple::remove_project_page(&layout.root, &name)?;
-                    record_unavailable(&mut report, &mut journal, &name, metadata_url)?;
-                }
-                Err(error) => record_error(
-                    &mut report,
-                    &mut journal,
-                    PackageError {
-                        name: name.clone(),
-                        error: format!("{error:#}"),
-                    },
-                )?,
-            }
-            completed += 1;
-            queue.discovery(discovery(&report, total, completed, &name))?;
-            Ok(!stop)
-        },
-    )?;
-    journal.packages.get_ref().sync_all()?;
-    journal.errors.get_ref().sync_all()?;
-    journal.unavailable.get_ref().sync_all()?;
-    write_json(&layout.root.join("check-report.json"), &report)?;
+                queue.discovery(discovery(&report, total, completed, &name))?;
+                Ok(true)
+            },
+        )
+    })();
+    if let Err(error) = inspected {
+        stop_inspection(queue, &mut report, &mut journal, format!("{error:#}"));
+    }
+    report.not_inspected = total.saturating_sub(completed);
+    let saved = (|| -> Result<()> {
+        journal.packages.get_ref().sync_all()?;
+        journal.errors.get_ref().sync_all()?;
+        journal.unavailable.get_ref().sync_all()?;
+        write_json(&layout.root.join("check-report.json"), &report)
+    })();
+    if let Err(error) = saved {
+        stop_inspection(
+            queue,
+            &mut report,
+            &mut journal,
+            format!("Cannot save inspection details: {error:#}"),
+        );
+    }
     Ok(report)
 }
 

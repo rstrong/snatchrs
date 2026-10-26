@@ -84,6 +84,7 @@ fn same_file(a: &DownloadTask, b: &DownloadTask) -> bool {
 pub struct DownloadOptions {
     pub concurrency: usize,
     pub attempts: u32,
+    pub min_free: u64,
     /// Maximum time without response data; active transfers have no total deadline.
     pub read_timeout: Duration,
 }
@@ -92,12 +93,13 @@ impl Default for DownloadOptions {
         Self {
             concurrency: 8,
             attempts: 3,
+            min_free: 1024 * 1024 * 1024,
             read_timeout: Duration::from_secs(900),
         }
     }
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct WorkerProgress {
     pub package: String,
     pub filename: String,
@@ -152,12 +154,14 @@ pub struct DiscoveryProgress {
     pub finished: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct DownloadProgress {
     pub discovery: DiscoveryProgress,
     pub total_files: usize,
     pub downloaded: usize,
     pub failed: usize,
+    pub not_attempted: usize,
+    pub stopped: Option<String>,
     pub total_bytes: u64,
     pub verified_bytes: u64,
     pub transferred_bytes: u64,
@@ -175,11 +179,22 @@ pub struct DownloadOutcome {
 #[derive(Debug, Serialize)]
 pub struct DownloadReport {
     pub concurrency: usize,
+    pub min_free: u64,
     pub progress: DownloadProgress,
     pub outcomes: Vec<DownloadOutcome>,
 }
 
+impl DownloadProgress {
+    pub fn completed_files(&self) -> usize {
+        self.downloaded + self.failed + self.not_attempted
+    }
+}
+
 enum Event {
+    Stopped(String),
+    Abandoned {
+        worker: usize,
+    },
     Queued {
         size: u64,
     },
@@ -206,31 +221,226 @@ enum Event {
     },
 }
 
-// Reserve space only for active transfers. Queued metadata must not prevent the
-// checker from advancing, even when a large backlog has accumulated.
+fn format_size(bytes: u64) -> String {
+    for (threshold, unit) in [
+        (1u64 << 60, "EiB"),
+        (1u64 << 50, "PiB"),
+        (1u64 << 40, "TiB"),
+        (1u64 << 30, "GiB"),
+        (1u64 << 20, "MiB"),
+        (1u64 << 10, "KiB"),
+    ] {
+        if bytes >= threshold {
+            return format!("{:.1} {unit}", bytes as f64 / threshold as f64);
+        }
+    }
+    format!("{bytes} {}", if bytes == 1 { "byte" } else { "bytes" })
+}
+
+/// A run-wide storage failure, with actionable filesystem and reserve details.
+#[derive(Debug)]
+pub struct StorageExhausted {
+    pub path: PathBuf,
+    pub needed: u64,
+    pub available: u64,
+    pub min_free: u64,
+    source: Option<anyhow::Error>,
+}
+impl std::fmt::Display for StorageExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Not enough disk space at {} (need {}, {} free, keeping --min-free {})",
+            self.path.display(),
+            format_size(self.needed),
+            format_size(self.available),
+            format_size(self.min_free)
+        )?;
+        Ok(())
+    }
+}
+impl std::error::Error for StorageExhausted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source.as_ref())
+    }
+}
+
+/// The shared queue cannot accept further work; ordinary package errors do not
+/// use this type and must not stop discovery.
+#[derive(Debug)]
+pub struct QueueUnavailable {
+    message: String,
+    source: Option<anyhow::Error>,
+}
+impl QueueUnavailable {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+    fn caused(message: impl Into<String>, source: anyhow::Error) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(source),
+        }
+    }
+}
+impl std::fmt::Display for QueueUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)?;
+        Ok(())
+    }
+}
+impl std::error::Error for QueueUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source.as_ref())
+    }
+}
+
+/// Parse bytes or binary K/M/G/T suffixes, optionally followed by B or iB.
+pub fn parse_size(value: &str) -> Result<u64> {
+    let value = value.trim();
+    let end = value.bytes().take_while(u8::is_ascii_digit).count();
+    ensure!(
+        end > 0,
+        "Invalid size {value:?}: use bytes or K, M, G, T (optionally B or iB)"
+    );
+    let amount: u64 = value[..end].parse().context("Size overflows u64")?;
+    let power = match value[end..].to_ascii_uppercase().as_str() {
+        "" | "B" => 0,
+        "K" | "KB" | "KIB" => 1,
+        "M" | "MB" | "MIB" => 2,
+        "G" | "GB" | "GIB" => 3,
+        "T" | "TB" | "TIB" => 4,
+        _ => anyhow::bail!("Invalid size {value:?}: use bytes or K, M, G, T (optionally B or iB)"),
+    };
+    amount
+        .checked_mul(1024u64.pow(power))
+        .context("Size overflows u64")
+}
+
+fn storage_error(
+    error: anyhow::Error,
+    path: &Path,
+    needed: u64,
+    available: u64,
+    min_free: u64,
+) -> anyhow::Error {
+    if error.downcast_ref::<StorageExhausted>().is_some() {
+        return error;
+    }
+    if error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            )
+        })
+    }) {
+        StorageExhausted {
+            path: path.into(),
+            needed,
+            available,
+            min_free,
+            source: Some(error),
+        }
+        .into()
+    } else {
+        error
+    }
+}
+
+#[derive(Default)]
+struct BudgetState {
+    reserved: u64,
+    stopped: Option<String>,
+}
+struct Budget {
+    state: Mutex<BudgetState>,
+    changed: Condvar,
+    min_free: u64,
+    available: fn(&Path) -> std::io::Result<u64>,
+}
+impl Budget {
+    fn new(min_free: u64) -> Self {
+        Self {
+            state: Mutex::new(BudgetState::default()),
+            changed: Condvar::new(),
+            min_free,
+            available: |root| fs4::available_space(root),
+        }
+    }
+    fn stop(&self, reason: String) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .stopped
+            .get_or_insert(reason);
+        self.changed.notify_all();
+    }
+    fn retry_wait(&self, delay: Duration) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, delay, |state| state.stopped.is_none())
+            .unwrap_or_else(|p| p.into_inner());
+        state.stopped.is_none()
+    }
+}
 struct Reservation {
     bytes: u64,
-    budget: Arc<Mutex<u64>>,
+    budget: Arc<Budget>,
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        *self.budget.lock().unwrap_or_else(|p| p.into_inner()) -= self.bytes;
+        self.budget
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reserved -= self.bytes;
+        self.budget.changed.notify_all();
     }
 }
-fn reserve_space(root: &Path, budget: &Arc<Mutex<u64>>, bytes: u64) -> Result<Reservation> {
-    let mut reserved = budget.lock().unwrap_or_else(|p| p.into_inner());
-    let needed = reserved
-        .checked_add(bytes)
-        .context("Reserved sizes overflow u64")?;
-    ensure!(
-        fs4::available_space(root)? >= needed,
-        "Not enough disk space for {needed} bytes of active downloads"
-    );
-    *reserved = needed;
-    Ok(Reservation {
-        bytes,
-        budget: budget.clone(),
-    })
+fn reserve_space(
+    root: &Path,
+    budget: &Arc<Budget>,
+    path: &Path,
+    bytes: u64,
+) -> Result<Reservation> {
+    let mut state = budget.state.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        if let Some(reason) = &state.stopped {
+            return Err(QueueUnavailable::new(format!("queue closed: {reason}")).into());
+        }
+        let available = (budget.available)(root)?;
+        if available >= budget.min_free
+            && bytes
+                <= available
+                    .saturating_sub(budget.min_free)
+                    .saturating_sub(state.reserved)
+        {
+            state.reserved += bytes;
+            return Ok(Reservation {
+                bytes,
+                budget: budget.clone(),
+            });
+        }
+        if state.reserved == 0 {
+            return Err(StorageExhausted {
+                path: root.join(path),
+                needed: bytes,
+                available,
+                min_free: budget.min_free,
+                source: None,
+            }
+            .into());
+        }
+        state = budget
+            .changed
+            .wait(state)
+            .unwrap_or_else(|p| p.into_inner());
+    }
 }
 
 struct DiskQueueState {
@@ -238,6 +448,7 @@ struct DiskQueueState {
     reader: BufReader<fs::File>,
     pending: usize,
     closed: bool,
+    stopped: Option<String>,
 }
 
 // Pending jobs are JSON lines on disk rather than a fixed-size channel. The
@@ -246,13 +457,26 @@ struct DiskQueue {
     state: Mutex<DiskQueueState>,
     ready: Condvar,
     _spool: tempfile::NamedTempFile,
+    budget: Arc<Budget>,
 }
 
 impl DiskQueue {
-    fn new(root: &Path) -> Result<Self> {
+    fn new(root: &Path, budget: Arc<Budget>) -> Result<Self> {
         let spool = tempfile::Builder::new()
             .prefix(".snatchrs-queue-")
-            .tempfile_in(root)?;
+            .tempfile_in(root)
+            .map_err(|error| {
+                QueueUnavailable::caused(
+                    "Cannot create download queue",
+                    storage_error(
+                        error.into(),
+                        &root.join(".snatchrs-queue"),
+                        0,
+                        (budget.available)(root).unwrap_or(0),
+                        budget.min_free,
+                    ),
+                )
+            })?;
         let state = DiskQueueState {
             // Reopen gives independent read/write offsets; try_clone would share
             // a file offset and corrupt the queue when used for append + read.
@@ -260,11 +484,13 @@ impl DiskQueue {
             reader: BufReader::new(spool.reopen()?),
             pending: 0,
             closed: false,
+            stopped: None,
         };
         Ok(Self {
             state: Mutex::new(state),
             ready: Condvar::new(),
             _spool: spool,
+            budget,
         })
     }
 
@@ -272,16 +498,33 @@ impl DiskQueue {
         let mut record = serde_json::to_vec(task)?;
         record.push(b'\n');
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        ensure!(!state.closed, "Download queue is closed");
-        state
-            .writer
-            .write_all(&record)
-            .context("Cannot append download queue")?;
-        // Announce before allowing a worker to take the job, so progress totals
-        // always include a file before its Started/Finished events arrive.
+        if state.closed {
+            return Err(QueueUnavailable::new(format!(
+                "queue closed: {}",
+                state.stopped.as_deref().unwrap_or("discovery finished")
+            ))
+            .into());
+        }
+        state.writer.write_all(&record).map_err(|error| {
+            QueueUnavailable::caused(
+                "Cannot append download queue",
+                storage_error(
+                    error.into(),
+                    self._spool.path(),
+                    record.len() as u64,
+                    (self.budget.available)(self._spool.path()).unwrap_or(0),
+                    self.budget.min_free,
+                ),
+            )
+        })?;
+        // Never block on the event channel while holding the queue lock: the
+        // progress consumer may need that lock to stop a full spool safely.
+        // Announce before making this record available to a worker.
+        drop(state);
         events
             .send(Event::Queued { size: task.size })
-            .context("Progress receiver closed")?;
+            .map_err(|_| QueueUnavailable::new("Progress receiver closed"))?;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.pending += 1;
         drop(state);
         self.ready.notify_one();
@@ -291,14 +534,20 @@ impl DiskQueue {
     fn next(&self) -> Result<Option<DownloadTask>> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         loop {
+            if state.stopped.is_some() {
+                return Ok(None);
+            }
             if state.pending > 0 {
                 let mut record = String::new();
                 ensure!(
-                    state.reader.read_line(&mut record)? > 0,
-                    "Download queue was truncated"
+                    state.reader.read_line(&mut record).map_err(|error| {
+                        QueueUnavailable::caused("Cannot read download queue", error.into())
+                    })? > 0,
+                    QueueUnavailable::new("Download queue was truncated")
                 );
-                let task =
-                    serde_json::from_str(&record).context("Invalid download queue record")?;
+                let task = serde_json::from_str(&record).map_err(|error| {
+                    QueueUnavailable::caused("Invalid download queue record", error.into())
+                })?;
                 state.pending -= 1;
                 return Ok(Some(task));
             }
@@ -307,6 +556,29 @@ impl DiskQueue {
             }
             state = self.ready.wait(state).unwrap_or_else(|p| p.into_inner());
         }
+    }
+
+    fn stop(&self, reason: String) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.stopped.is_some() {
+            return false;
+        }
+        state.stopped = Some(reason.clone());
+        state.closed = true;
+        drop(state);
+        self.budget.stop(reason);
+        self.ready.notify_all();
+        true
+    }
+    fn pending_count(&self) -> usize {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).pending
+    }
+    fn stop_reason(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .stopped
+            .clone()
     }
 
     fn close(&self) {
@@ -329,10 +601,22 @@ impl DownloadQueue {
     pub fn discovery(&self, progress: DiscoveryProgress) -> Result<()> {
         self.events
             .send(Event::Discovery(progress))
-            .context("Progress receiver closed")
+            .map_err(|_| QueueUnavailable::new("Progress receiver closed").into())
+    }
+
+    pub fn stop_reason(&self) -> Option<String> {
+        self.jobs.stop_reason()
+    }
+    pub fn stop(&self, reason: String) {
+        if self.jobs.stop(reason.clone()) {
+            let _ = self.events.send(Event::Stopped(reason));
+        }
     }
 
     pub fn enqueue(&mut self, mut task: DownloadTask) -> Result<()> {
+        if let Some(reason) = self.stop_reason() {
+            return Err(QueueUnavailable::new(format!("queue closed: {reason}")).into());
+        }
         // Accept existing batch callers' absolute paths under this mirror, but
         // persist and report only paths relative to its root.
         if task.local_path.is_absolute() {
@@ -369,7 +653,10 @@ impl DownloadQueue {
             .total_bytes
             .checked_add(task.size)
             .context("Download sizes overflow u64")?;
-        self.jobs.push(&task, &self.events)?;
+        if let Err(error) = self.jobs.push(&task, &self.events) {
+            self.stop(format!("{error:#}"));
+            return Err(error);
+        }
         self.seen.insert(task.local_path, fingerprint);
         self.total_bytes = total_bytes;
         Ok(())
@@ -403,21 +690,18 @@ pub fn download_all(
     options: DownloadOptions,
     progress: impl FnMut(&DownloadProgress),
 ) -> Result<DownloadReport> {
-    let total = tasks.iter().try_fold(0u64, |sum, task| {
-        sum.checked_add(task.size)
-            .context("Download sizes overflow u64")
-    })?;
-    ensure!(
-        fs4::available_space(root)? >= total,
-        "Not enough disk space for {total} bytes of downloads"
-    );
     let (_, report) = stream_with_workers(
         root,
         options,
         options.concurrency.min(tasks.len()),
         |queue| {
             for task in tasks {
-                queue.enqueue(task.clone())?;
+                if let Err(error) = queue.enqueue(task.clone()) {
+                    if error.downcast_ref::<QueueUnavailable>().is_some() {
+                        break;
+                    }
+                    return Err(error);
+                }
             }
             Ok(())
         },
@@ -496,6 +780,8 @@ fn stream_with_workers<T: Send>(
         total_files: 0,
         downloaded: 0,
         failed: 0,
+        not_attempted: 0,
+        stopped: None,
         total_bytes: 0,
         verified_bytes: 0,
         transferred_bytes: 0,
@@ -506,8 +792,8 @@ fn stream_with_workers<T: Send>(
     };
     progress(&state);
     let (events, receiver) = mpsc::sync_channel(worker_count.max(1) * 2);
-    let jobs = Arc::new(DiskQueue::new(&root)?);
-    let budget = Arc::new(Mutex::new(0));
+    let budget = Arc::new(Budget::new(options.min_free));
+    let jobs = Arc::new(DiskQueue::new(&root, budget.clone())?);
     let queue = DownloadQueue {
         root: root.clone(),
         jobs: jobs.clone(),
@@ -516,10 +802,12 @@ fn stream_with_workers<T: Send>(
         seen_package: None,
         total_bytes: 0,
     };
+    let controller = jobs.clone();
     let start = Instant::now();
     let mut last_update = Instant::now();
     let mut outcomes = Vec::new();
     let mut sink_error = None;
+    let mut abandoned_jobs = 0;
     let produced = thread::scope(|scope| -> Result<T> {
         let mut handles = Vec::new();
         for worker in 0..worker_count {
@@ -532,9 +820,18 @@ fn stream_with_workers<T: Send>(
             handles.push(scope.spawn(move || -> Result<()> {
                 let _runtime = read_runtime.enter();
                 loop {
-                    let Some(task) = jobs.next()? else {
-                        break;
+                    let task = match jobs.next() {
+                        Ok(Some(task)) => task,
+                        Ok(None) => break,
+                        Err(error) => {
+                            let reason = format!("{error:#}");
+                            if jobs.stop(reason.clone()) {
+                                let _ = events.send(Event::Stopped(reason));
+                            }
+                            break;
+                        }
                     };
+                    let mut abandoned = false;
                     let mut outcome = DownloadOutcome {
                         task: task.clone(),
                         attempts: 0,
@@ -556,8 +853,8 @@ fn stream_with_workers<T: Send>(
                         {
                             return Ok(());
                         }
-                        let result =
-                            reserve_space(root, budget, task.size).and_then(|_reservation| {
+                        let result = reserve_space(root, budget, &task.local_path, task.size)
+                            .and_then(|_reservation| {
                                 download_one(client, root, &task, |bytes| {
                                     let _ = events.send(Event::Bytes { worker, bytes });
                                 })
@@ -570,7 +867,28 @@ fn stream_with_workers<T: Send>(
                                 break;
                             }
                             Err(error) => {
+                                let error = storage_error(
+                                    error,
+                                    &root.join(&task.local_path),
+                                    task.size,
+                                    (budget.available)(root).unwrap_or(0),
+                                    options.min_free,
+                                );
+                                if error.downcast_ref::<QueueUnavailable>().is_some() {
+                                    abandoned = true;
+                                    break;
+                                }
                                 outcome.error = Some(format!("{error:#}"));
+                                if error.downcast_ref::<StorageExhausted>().is_some() {
+                                    let reason = format!("{error:#}");
+                                    if jobs.stop(reason.clone()) {
+                                        let _ = events.send(Event::Stopped(reason));
+                                    }
+                                    break;
+                                }
+                                if jobs.stop_reason().is_some() {
+                                    break;
+                                }
                                 let Some(delay) =
                                     crate::http::retry_delay(attempt, options.attempts, &error)
                                 else {
@@ -579,9 +897,15 @@ fn stream_with_workers<T: Send>(
                                 if events.send(Event::Retrying { worker, delay }).is_err() {
                                     return Ok(());
                                 }
-                                thread::sleep(delay);
+                                if !budget.retry_wait(delay) {
+                                    break;
+                                }
                             }
                         }
+                    }
+                    if abandoned {
+                        let _ = events.send(Event::Abandoned { worker });
+                        continue;
                     }
                     if events
                         .send(Event::Finished {
@@ -612,6 +936,14 @@ fn stream_with_workers<T: Send>(
             };
             if let Some(event) = event {
                 match event {
+                    Event::Stopped(reason) => {
+                        state.stopped.get_or_insert(reason);
+                    }
+                    Event::Abandoned { worker } => {
+                        abandoned_jobs += 1;
+                        state.workers[worker].state = WorkerState::Waiting;
+                        state.workers[worker].retry_delay_seconds = None;
+                    }
                     Event::Queued { size } => {
                         state.total_files += 1;
                         state.total_bytes += size;
@@ -657,6 +989,18 @@ fn stream_with_workers<T: Send>(
                             if sink_error.is_none()
                                 && let Err(error) = sink(&outcome)
                             {
+                                let error = storage_error(
+                                    error,
+                                    &root.join("download-outcomes.jsonl"),
+                                    0,
+                                    (budget.available)(&root).unwrap_or(0),
+                                    options.min_free,
+                                );
+                                if error.downcast_ref::<StorageExhausted>().is_some() {
+                                    let reason = format!("{error:#}");
+                                    controller.stop(reason.clone());
+                                    state.stopped.get_or_insert(reason);
+                                }
                                 sink_error = Some(error);
                             }
                         } else {
@@ -665,9 +1009,15 @@ fn stream_with_workers<T: Send>(
                     }
                 }
             }
+            if state.stopped.is_some() {
+                state.not_attempted = (controller.pending_count() + abandoned_jobs).min(
+                    state
+                        .total_files
+                        .saturating_sub(state.downloaded + state.failed),
+                );
+            }
             if last_update.elapsed() >= Duration::from_millis(80)
-                || (state.discovery.finished
-                    && state.downloaded + state.failed == state.total_files)
+                || (state.discovery.finished && state.completed_files() == state.total_files)
             {
                 state.elapsed_seconds = start.elapsed().as_secs_f64();
                 progress(&state);
@@ -684,6 +1034,9 @@ fn stream_with_workers<T: Send>(
             .map_err(|_| anyhow::anyhow!("Metadata producer panicked"))?
     })?;
     state.elapsed_seconds = start.elapsed().as_secs_f64();
+    state.not_attempted = state
+        .total_files
+        .saturating_sub(state.downloaded + state.failed);
     progress(&state);
     if let Some(error) = sink_error {
         return Err(error.context("Cannot record download outcome"));
@@ -693,6 +1046,7 @@ fn stream_with_workers<T: Send>(
         produced,
         DownloadReport {
             concurrency: options.concurrency,
+            min_free: options.min_free,
             progress: state,
             outcomes,
         },
@@ -792,7 +1146,7 @@ mod dedupe_tests {
         let (events, _receiver) = mpsc::sync_channel(4);
         let mut queue = DownloadQueue {
             root: root.path().canonicalize().unwrap(),
-            jobs: Arc::new(DiskQueue::new(root.path()).unwrap()),
+            jobs: Arc::new(DiskQueue::new(root.path(), Arc::new(Budget::new(0))).unwrap()),
             events,
             seen: BTreeMap::new(),
             seen_package: None,
@@ -817,5 +1171,200 @@ mod dedupe_tests {
             assert_eq!(queue.seen_package.as_deref(), Some(name));
         }
         assert_eq!(queue.total_bytes, 3);
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use std::io::{self, ErrorKind};
+
+    fn budget() -> Arc<Budget> {
+        Arc::new(Budget {
+            available: |_| Ok(10),
+            ..Budget::new(2)
+        })
+    }
+
+    #[test]
+    fn formats_storage_sizes_with_one_decimal_binary_units() {
+        for (bytes, expected) in [
+            (0, "0 bytes"),
+            (1, "1 byte"),
+            (1023, "1023 bytes"),
+            (1024, "1.0 KiB"),
+            (18236, "17.8 KiB"),
+            (1024 * 1024, "1.0 MiB"),
+            (2673950720, "2.5 GiB"),
+            (1099511627776000, "1000.0 TiB"),
+        ] {
+            assert_eq!(format_size(bytes), expected);
+        }
+        let error = StorageExhausted {
+            path: "packages/pkg/file.whl".into(),
+            needed: 18236,
+            available: 2673950720,
+            min_free: 1099511627776000,
+            source: None,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("need 17.8 KiB, 2.5 GiB free, keeping --min-free 1000.0 TiB")
+        );
+    }
+
+    #[test]
+    fn parses_binary_min_free_sizes_and_rejects_overflows() {
+        for (value, expected) in [
+            ("0", 0),
+            ("1024", 1024),
+            ("10K", 10 * 1024),
+            ("1G", 1024u64.pow(3)),
+            ("1GiB", 1024u64.pow(3)),
+            ("2t", 2 * 1024u64.pow(4)),
+            ("3mb", 3 * 1024 * 1024),
+            ("4kIb", 4096),
+        ] {
+            assert_eq!(parse_size(value).unwrap(), expected);
+        }
+        for value in [
+            "",
+            "garbage",
+            "-1",
+            "1.5G",
+            "1GBB",
+            "1Ki",
+            "1 P",
+            "18446744073709551616",
+            "18446744073709551615T",
+        ] {
+            assert!(parse_size(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn nested_full_and_quota_errors_are_typed_and_never_retried() {
+        for kind in [
+            ErrorKind::StorageFull,
+            ErrorKind::QuotaExceeded,
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+        ] {
+            let error = anyhow::Error::new(io::Error::from(kind))
+                .context("persist")
+                .context("download");
+            let error = storage_error(error, Path::new("packages/pkg/file.whl"), 9, 10, 2);
+            let full = matches!(kind, ErrorKind::StorageFull | ErrorKind::QuotaExceeded);
+            assert_eq!(error.downcast_ref::<StorageExhausted>().is_some(), full);
+            if full {
+                assert!(crate::http::retry_delay(1, 3, &error).is_none());
+                let message = error.to_string();
+                for text in [
+                    "packages/pkg/file.whl",
+                    "9 bytes",
+                    "10 bytes",
+                    "--min-free 2",
+                ] {
+                    assert!(message.contains(text), "{message}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reserves_and_releases_or_reports_that_a_file_cannot_fit_alone() {
+        let budget = budget();
+        let reservation = reserve_space(Path::new("."), &budget, Path::new("file"), 8).unwrap();
+        assert_eq!(budget.state.lock().unwrap().reserved, 8);
+        drop(reservation);
+        assert_eq!(budget.state.lock().unwrap().reserved, 0);
+        let error = reserve_space(Path::new("."), &budget, Path::new("file"), 9)
+            .err()
+            .unwrap();
+        let error = error.downcast_ref::<StorageExhausted>().unwrap();
+        assert_eq!((error.needed, error.available, error.min_free), (9, 10, 2));
+    }
+
+    #[test]
+    fn reservation_waits_for_other_transfers_and_wakes_on_stop() {
+        for stopping in [false, true] {
+            let budget = budget();
+            let held = reserve_space(Path::new("."), &budget, Path::new("first"), 6).unwrap();
+            let other = budget.clone();
+            let (sent, received) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                let result = reserve_space(Path::new("."), &other, Path::new("second"), 5);
+                sent.send(result.map(|reservation| {
+                    drop(reservation);
+                }))
+                .unwrap();
+            });
+            assert!(received.recv_timeout(Duration::from_millis(60)).is_err());
+            if stopping {
+                budget.stop("test shutdown".into());
+            } else {
+                drop(held);
+            }
+            let result = received
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reservation must wake");
+            if stopping {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<QueueUnavailable>()
+                        .is_some()
+                );
+            } else {
+                result.unwrap();
+            }
+            handle.join().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_spool_errors_close_the_queue_and_preserve_the_storage_cause() {
+        // /dev/full deterministically returns ENOSPC without filling a disk.
+        let root = tempfile::tempdir().unwrap();
+        let budget = Arc::new(Budget::new(0));
+        let jobs = Arc::new(DiskQueue::new(root.path(), budget).unwrap());
+        jobs.state.lock().unwrap().writer = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let (events, _receiver) = mpsc::sync_channel(4);
+        let mut queue = DownloadQueue {
+            root: root.path().into(),
+            jobs,
+            events,
+            seen: BTreeMap::new(),
+            seen_package: None,
+            total_bytes: 0,
+        };
+        let error = queue
+            .enqueue(DownloadTask {
+                package: "pkg".into(),
+                filename: "file.whl".into(),
+                local_path: "file.whl".into(),
+                download_url: "http://127.0.0.1:1/file".parse().unwrap(),
+                size: 1,
+                sha256: None,
+            })
+            .unwrap_err();
+        assert!(error.downcast_ref::<QueueUnavailable>().is_some());
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<StorageExhausted>().is_some())
+        );
+        assert!(
+            queue
+                .stop_reason()
+                .unwrap()
+                .contains("Not enough disk space")
+        );
+        assert!(queue.jobs.next().unwrap().is_none());
     }
 }

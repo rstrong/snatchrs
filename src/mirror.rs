@@ -385,7 +385,7 @@ pub struct CheckedPackage {
     pub files: Vec<CheckedFile>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct CheckSummary {
     pub packages: usize,
     pub releases: usize,

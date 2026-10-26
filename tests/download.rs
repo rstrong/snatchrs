@@ -60,6 +60,7 @@ fn options(concurrency: usize, attempts: u32) -> DownloadOptions {
     DownloadOptions {
         concurrency,
         attempts,
+        min_free: 0,
         read_timeout: Duration::from_secs(5),
     }
 }
@@ -214,10 +215,14 @@ fn empty_queue_limits_and_mirror_lock() {
     assert!(download_all(directory.path(), &[], options(65, 1), |_| {}).is_err());
     let mut huge = task(directory.path(), "http://127.0.0.1:1", "huge.whl", b"");
     huge.size = u64::MAX;
+    let report = download_all(directory.path(), &[huge], options(1, 1), |_| {}).unwrap();
+    assert_eq!(report.progress.failed, 1);
     assert!(
-        download_all(directory.path(), &[huge], options(1, 1), |_| {})
-            .unwrap_err()
-            .to_string()
+        report
+            .progress
+            .stopped
+            .as_deref()
+            .unwrap()
             .contains("Not enough disk space")
     );
     let outside = tempdir().unwrap();
@@ -645,7 +650,7 @@ fn checking_can_enqueue_every_job_while_download_workers_are_blocked() {
 }
 
 #[test]
-fn queued_artifact_size_does_not_stop_checking_and_active_space_failures_are_reported() {
+fn oversized_transfer_stops_without_retrying_or_leaving_partial_files() {
     let directory = tempdir().unwrap();
     let mut huge = task(directory.path(), "http://127.0.0.1:1", "huge.whl", b"");
     huge.size = u64::MAX;
@@ -654,12 +659,13 @@ fn queued_artifact_size_does_not_stop_checking_and_active_space_failures_are_rep
         options(1, 5),
         |queue| {
             queue.enqueue(huge)?;
-            Ok("checker continued")
+            Ok("producer finished")
         },
         |_| {},
     )
     .unwrap();
-    assert_eq!(checked, "checker continued");
+    assert_eq!(checked, "producer finished");
+    assert!(report.progress.stopped.is_some());
     assert_eq!(report.progress.failed, 1);
     assert_eq!(report.outcomes[0].attempts, 1);
     assert!(
