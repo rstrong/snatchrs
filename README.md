@@ -239,9 +239,12 @@ boolean or string `yanked` values. Relative file URLs are resolved against the
 final response URL, including redirects. Files are grouped into the advertised
 `versions` using their filenames, with PEP 440 equivalence for normalized version
 spellings and support for legacy egg/installer names. Distribution type is inferred
-from the filename. Ambiguous or unassignable files fail explicitly rather than
-being silently omitted. If an older response omits `versions`, versions are
-inferred from recognizable filenames. Missing file sizes fail explicitly, since
+from the filename. Release labels are informational: equivalent advertised
+spellings are resolved deterministically, and legacy names use the longest
+matching version prefix. If no advertised release fits, the filename-derived
+version or `unknown` is used, so an odd filename never excludes a file or fails
+the project. If an older response omits `versions`, versions are inferred from
+recognizable filenames. Missing file sizes fail explicitly, since
 size checks require them. There is no fallback to the deprecated project JSON API.
 
 File inspection records `missing`, `size_mismatch` (including actual size),

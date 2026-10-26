@@ -86,7 +86,7 @@ impl PackageMetadata {
                 matches!(url.scheme(), "https" | "http"),
                 "File URL must use HTTP or HTTPS"
             );
-            let version = names.version(&file.filename, &package.normalized_name)?;
+            let version = names.version(&file.filename, &package.normalized_name);
             let package_type = package_type(&file.filename);
             releases.entry(version).or_default().push(DistributionFile {
                 local_path: package_path.join(&file.filename),

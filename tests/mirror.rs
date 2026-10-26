@@ -166,14 +166,36 @@ fn infers_versions_when_older_simple_response_omits_versions() {
 }
 
 #[test]
-fn rejects_ambiguous_unlisted_and_malformed_simple_metadata() {
+fn retains_files_with_ambiguous_unlisted_or_unrecognized_release_names() {
+    let directory = tempdir().unwrap();
+    let layout = MirrorLayout::create(directory.path()).unwrap();
+    for (value, expected) in [
+        (
+            simple(&["1.0", "1.0.0"], &["example_pkg-1.0.00-py3-none-any.whl"]),
+            "1.0",
+        ),
+        (simple(&["1.0", "2.0"], &["example_pkg-3.0.tar.gz"]), "3.0"),
+        (simple(&["1.0", "2.0"], &["opaque.blob"]), "unknown"),
+        (simple(&[], &["example_pkg-1.0.tar.gz"]), "1.0"),
+    ] {
+        let metadata = parse(&value.to_string(), &layout).unwrap();
+        let nonempty: Vec<_> = metadata
+            .releases
+            .iter()
+            .filter(|release| !release.files.is_empty())
+            .collect();
+        assert_eq!(nonempty.len(), 1);
+        assert_eq!(nonempty[0].version, expected);
+        assert_eq!(nonempty[0].files.len(), 1);
+        assert_eq!(nonempty[0].files[0].filename, value["files"][0]["filename"]);
+    }
+}
+
+#[test]
+fn rejects_malformed_simple_metadata() {
     let directory = tempdir().unwrap();
     let layout = MirrorLayout::create(directory.path()).unwrap();
     for value in [
-        simple(&["1.0", "1.0.0"], &["example_pkg-1.0.00-py3-none-any.whl"]),
-        simple(&["1.0", "2.0"], &["example_pkg-3.0.tar.gz"]),
-        simple(&["1.0", "2.0"], &["opaque.blob"]),
-        simple(&[], &["example_pkg-1.0.tar.gz"]),
         simple(&[""], &[]),
         serde_json::json!({"info": {"name": "Example_Pkg"}, "releases": {}}),
     ] {

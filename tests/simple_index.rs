@@ -31,6 +31,11 @@ struct Server {
 }
 impl Server {
     fn start() -> Self {
+        Self::with_files(&["1.0+local"], &FILENAMES)
+    }
+    fn with_files(versions: &[&str], filenames: &[&str]) -> Self {
+        let versions: Vec<String> = versions.iter().map(|name| (*name).into()).collect();
+        let filenames: Vec<String> = filenames.iter().map(|name| (*name).into()).collect();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -68,8 +73,8 @@ impl Server {
                     if missing.load(Ordering::Acquire) {
                         (404, b"deleted".to_vec())
                     } else {
-                        (200, serde_json::json!({"name":"Example_Pkg", "meta":{"api-version":"1.4"}, "versions":["1.0+local"],
-                            "files": FILENAMES.iter().enumerate().map(|(i, filename)| serde_json::json!({
+                        (200, serde_json::json!({"name":"Example_Pkg", "meta":{"api-version":"1.4"}, "versions":versions,
+                            "files": filenames.iter().enumerate().map(|(i, filename)| serde_json::json!({
                                 "filename": filename, "url":format!("{origin}/artifact/{i}"), "size":BODY.len(),
                                 "hashes":{"sha256":format!("{:x}", Sha256::digest(BODY))}, "requires-python": ">=3.8"
                             })).collect::<Vec<_>>()}).to_string().into_bytes())
@@ -255,4 +260,112 @@ fn simple_takes_the_mirror_lock_and_can_generate_an_empty_index() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("0 projects written"));
     assert!(root.path().join("simple/index.html").is_file());
+}
+
+#[test]
+fn odd_release_filenames_are_checked_downloaded_published_and_verified() {
+    let filenames = [
+        "example_pkg-1.0.1.dev3460.win32-py2.4.exe",
+        "example_pkg-9.0-py3-none-any.whl",
+        "unrecognized.blob",
+    ];
+    let server = Server::with_files(&["1.0", "1.0.1"], &filenames);
+    let root = tempdir().unwrap();
+    let checked: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "check").stdout).unwrap();
+    assert_eq!(checked["error_count"], 0);
+    assert_eq!(checked["summary"]["files"], 3);
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("metadata/example-pkg.json")).unwrap())
+            .unwrap();
+    for (filename, version) in filenames.iter().zip(["1.0.1", "9.0", "unknown"]) {
+        let release = metadata["releases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|release| release["version"] == version)
+            .unwrap();
+        assert_eq!(release["files"][0]["filename"], *filename);
+    }
+    let mirrored: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "mirror").stdout).unwrap();
+    assert_eq!(mirrored["inspection"]["error_count"], 0);
+    assert_eq!(mirrored["downloads"]["progress"]["downloaded"], 3);
+    let page = fs::read_to_string(root.path().join("simple/example-pkg/index.html")).unwrap();
+    assert_eq!(hrefs(&page).len(), 3);
+    for filename in filenames {
+        assert!(page.contains(filename));
+        assert_eq!(
+            fs::read(root.path().join("packages/example-pkg").join(filename)).unwrap(),
+            BODY
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
+        .arg("verify")
+        .arg(root.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let verified: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(verified["ok"], 3);
+    assert_eq!(verified["project_errors"], 0);
+}
+
+#[test]
+fn spaced_and_local_version_filenames_are_mirrored_with_encoded_links() {
+    let filenames = ["Car Crash Detection-0.0.1.tar.gz", "weboob-1.3+1.tar.gz"];
+    let server = Server::with_files(&["8.0", "9.0"], &filenames);
+    let root = tempdir().unwrap();
+    let checked: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "check").stdout).unwrap();
+    assert_eq!(checked["error_count"], 0);
+    assert_eq!(checked["summary"]["files"], 2);
+    let mirrored: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "mirror").stdout).unwrap();
+    assert_eq!(mirrored["inspection"]["error_count"], 0);
+    assert_eq!(mirrored["downloads"]["progress"]["downloaded"], 2);
+    let project = root.path().join("simple/example-pkg");
+    let page = fs::read_to_string(project.join("index.html")).unwrap();
+    let links = hrefs(&page);
+    assert_eq!(links.len(), 2);
+    assert!(
+        links
+            .iter()
+            .any(|link| link.contains("Car%20Crash%20Detection-0.0.1.tar.gz"))
+    );
+    assert!(
+        links
+            .iter()
+            .any(|link| link.contains("weboob-1.3%2B1.tar.gz"))
+    );
+    let base = Url::from_directory_path(project).unwrap();
+    for link in links {
+        let path = base.join(link).unwrap().to_file_path().unwrap();
+        assert_eq!(fs::read(path).unwrap(), BODY);
+    }
+    for filename in filenames {
+        assert_eq!(
+            fs::read(root.path().join("packages/example-pkg").join(filename)).unwrap(),
+            BODY
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
+        .arg("verify")
+        .arg(root.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let verified: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(verified["ok"], 2);
+    assert_eq!(verified["project_errors"], 0);
 }
