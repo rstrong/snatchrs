@@ -7,6 +7,9 @@ pub mod mirror;
 pub mod selection;
 pub mod simple;
 
+pub mod cleanup;
+pub mod interrupt;
+
 use std::{
     io::{BufReader, Read},
     time::Duration,
@@ -128,6 +131,7 @@ impl<'a> IntoIterator for &'a PackageIndex {
 pub struct IndexClient {
     client: Client,
     attempts: u32,
+    interrupt: interrupt::StopToken,
 }
 
 impl IndexClient {
@@ -146,7 +150,13 @@ impl IndexClient {
                 .gzip(true)
                 .build()?,
             attempts,
+            interrupt: interrupt::StopToken::default(),
         })
+    }
+
+    pub fn with_interrupt(mut self, interrupt: interrupt::StopToken) -> Self {
+        self.interrupt = interrupt;
+        self
     }
 
     pub fn fetch(&self, index_url: Url) -> Result<PackageIndex> {
@@ -164,6 +174,7 @@ impl IndexClient {
             &index_url,
             JSON_MEDIA_TYPE,
             self.attempts,
+            &self.interrupt,
             |response| {
                 let effective_url = response.url().clone();
                 PackageIndex::from_reader_with_progress(response, effective_url, &mut progress)

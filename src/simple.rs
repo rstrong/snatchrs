@@ -23,6 +23,7 @@ pub struct PageError {
 
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
 pub struct SimpleSummary {
+    pub stale_temp_files_removed: usize,
     pub projects: usize,
     pub files_linked: usize,
     pub files_skipped: usize,
@@ -53,6 +54,7 @@ impl SimpleSummary {
         )
     }
     pub fn add(&mut self, page: Self) {
+        self.stale_temp_files_removed += page.stale_temp_files_removed;
         self.projects += page.projects;
         self.files_linked += page.files_linked;
         self.files_skipped += page.files_skipped;
@@ -158,6 +160,7 @@ pub fn write_project_page(root: &Path, metadata: &PackageMetadata) -> Result<Sim
         name == metadata.package.normalized_name,
         "Inconsistent normalized project name"
     );
+    let stale_temp_files_removed = crate::cleanup::sweep_project(root, &name);
     let package_path = PathBuf::from("packages").join(&name);
     create_directory(&resolve_path(root, Path::new("packages"))?)?;
     real_directory_exists(&resolve_path(root, &package_path)?)?;
@@ -166,6 +169,7 @@ pub fn write_project_page(root: &Path, metadata: &PackageMetadata) -> Result<Sim
     let project = simple.join(&name);
     create_directory(&project)?;
     let mut summary = SimpleSummary {
+        stale_temp_files_removed,
         projects: 1,
         ..Default::default()
     };
@@ -297,10 +301,20 @@ pub fn remove_project_page(root: &Path, name: &str) -> Result<()> {
 /// Regenerate project pages from one enriched metadata file at a time. The
 /// caller must hold the mirror lock, as the CLI does for all mirror mutations.
 pub fn regenerate(root: &Path) -> Result<SimpleSummary> {
+    regenerate_interruptible(root, &crate::interrupt::StopToken::default())
+}
+
+pub fn regenerate_interruptible(
+    root: &Path,
+    interrupt: &crate::interrupt::StopToken,
+) -> Result<SimpleSummary> {
     let metadata_dir = resolve_path(root, Path::new("metadata"))?;
     create_directory(&metadata_dir)?;
     let mut summary = SimpleSummary::default();
     for entry in fs::read_dir(&metadata_dir)? {
+        if interrupt.is_interrupted() {
+            break;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -342,22 +356,24 @@ pub fn regenerate(root: &Path) -> Result<SimpleSummary> {
             Err(error) => summary.record_error(name, error),
         }
     }
-    match project_names(root) {
-        Ok(names) => {
-            for name in names {
-                match fs::symlink_metadata(metadata_dir.join(format!("{name}.json"))) {
-                    Ok(_) => {} // Existing but corrupt/unreadable metadata keeps its old page.
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        match remove_project_page(root, &name) {
-                            Ok(()) => summary.projects_removed += 1,
-                            Err(error) => summary.record_error(name, error),
+    if !interrupt.is_interrupted() {
+        match project_names(root) {
+            Ok(names) => {
+                for name in names {
+                    match fs::symlink_metadata(metadata_dir.join(format!("{name}.json"))) {
+                        Ok(_) => {} // Existing but corrupt/unreadable metadata keeps its old page.
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            match remove_project_page(root, &name) {
+                                Ok(()) => summary.projects_removed += 1,
+                                Err(error) => summary.record_error(name, error),
+                            }
                         }
+                        Err(error) => summary.record_error(name, error.into()),
                     }
-                    Err(error) => summary.record_error(name, error.into()),
                 }
             }
+            Err(error) => summary.record_error("<root>", error),
         }
-        Err(error) => summary.record_error("<root>", error),
     }
     if let Err(error) = write_root_index(root) {
         summary.record_error("<root>", error);

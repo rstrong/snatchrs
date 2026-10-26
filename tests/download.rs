@@ -285,6 +285,8 @@ fn cli_downloads_then_skips_existing_file_on_repeat() {
         let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
             .args([
                 "mirror",
+                "--min-free",
+                "0",
                 "--package",
                 "test",
                 "--metadata-url",
@@ -375,6 +377,8 @@ fn mirror_respects_samples_above_one_hundred_and_smaller_indexes() {
             Command::new(env!("CARGO_BIN_EXE_snatchrs"))
                 .args([
                     "mirror",
+                    "--min-free",
+                    "0",
                     "--sample",
                     &count.to_string(),
                     "--seed",
@@ -522,6 +526,8 @@ fn downloads_and_progress_start_before_later_metadata_finishes() {
     let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
         .args([
             "mirror",
+            "--min-free",
+            "0",
             "--package",
             "early",
             "--package",

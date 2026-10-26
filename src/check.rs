@@ -76,6 +76,7 @@ struct MetadataOptions {
     base: Url,
     refresh: bool,
     concurrency: usize,
+    interrupt: snatchrs::interrupt::StopToken,
 }
 
 // Fetches finish out of order. Only this bounded channel crosses back to the
@@ -99,7 +100,7 @@ fn parallel_metadata(
             let jobs = &jobs;
             let cancelled = &cancelled;
             handles.push(scope.spawn(move || {
-                while !cancelled.load(Ordering::Acquire) {
+                while !cancelled.load(Ordering::Acquire) && !options.interrupt.is_interrupted() {
                     let Some(package) = jobs.lock().unwrap_or_else(|p| p.into_inner()).next()
                     else {
                         break;
@@ -147,6 +148,8 @@ struct PackageError {
 #[derive(Clone, Serialize)]
 struct CheckReport {
     mirror_root: PathBuf,
+    stale_temp_files_removed: usize,
+    stopped: Option<String>,
     metadata_concurrency: usize,
     seed: Option<u64>,
     selection: SelectionMode,
@@ -231,7 +234,13 @@ pub struct MirrorArgs {
     min_free: u64,
 }
 
-pub fn run_mirror(args: MirrorArgs, quiet: bool, no_progress: bool, attempts: u32) -> Result<()> {
+pub fn run_mirror(
+    args: MirrorArgs,
+    quiet: bool,
+    no_progress: bool,
+    attempts: u32,
+    interrupt: &snatchrs::interrupt::StopToken,
+) -> Result<()> {
     run_inner(
         args.selection,
         quiet,
@@ -243,11 +252,18 @@ pub fn run_mirror(args: MirrorArgs, quiet: bool, no_progress: bool, attempts: u3
             ..Default::default()
         }),
         attempts,
+        interrupt,
     )
 }
 
-pub fn run(args: CheckArgs, quiet: bool, no_progress: bool, attempts: u32) -> Result<()> {
-    run_inner(args, quiet, no_progress, None, attempts)
+pub fn run(
+    args: CheckArgs,
+    quiet: bool,
+    no_progress: bool,
+    attempts: u32,
+    interrupt: &snatchrs::interrupt::StopToken,
+) -> Result<()> {
+    run_inner(args, quiet, no_progress, None, attempts, interrupt)
 }
 
 fn run_inner(
@@ -256,13 +272,14 @@ fn run_inner(
     no_progress: bool,
     download: Option<snatchrs::download::DownloadOptions>,
     attempts: u32,
+    interrupt: &snatchrs::interrupt::StopToken,
 ) -> Result<()> {
     let start = Instant::now();
     let interactive = crate::interactive(quiet, no_progress, args.json);
     let mut dashboard = interactive.then(crate::progress::Dashboard::new);
     let layout = MirrorLayout::create(&args.mirror)?;
     let _lock = layout.lock()?;
-    let client = IndexClient::with_attempts(attempts)?;
+    let client = IndexClient::with_attempts(attempts)?.with_interrupt(interrupt.clone());
     let metadata_url = args
         .metadata_url
         .clone()
@@ -271,6 +288,7 @@ fn run_inner(
         base: metadata_url,
         refresh: args.refresh,
         concurrency: usize::from(args.metadata_concurrency),
+        interrupt: interrupt.clone(),
     };
     let seed = args.sample.map(|_| args.seed.unwrap_or_else(rand::random));
     let selection = if args.all {
@@ -284,29 +302,37 @@ fn run_inner(
     };
     let mut authoritative_names = None;
     let packages = if args.all || args.sample.is_some() {
-        let mut index =
+        let fetched =
             client.fetch_with_progress(args.index_url.clone(), |event: IndexProgress<'_>| {
                 if let Some(dashboard) = dashboard.as_mut() {
                     dashboard.update(event);
                 }
-            })?;
-        // Deduplicate in place; --all moves the index's existing package vector
-        // into the worker pool rather than cloning it or recording every name.
-        let mut names = HashSet::new();
-        index
-            .packages
-            .retain(|package| names.insert(package.normalized_name.clone()));
-        if args.all {
-            if download.is_some() {
-                authoritative_names = Some(names);
+            });
+        match fetched {
+            Ok(mut index) => {
+                // Deduplicate in place; --all moves the index's existing package vector
+                // into the worker pool rather than cloning it or recording every name.
+                let mut names = HashSet::new();
+                index
+                    .packages
+                    .retain(|package| names.insert(package.normalized_name.clone()));
+                if args.all {
+                    if download.is_some() {
+                        authoritative_names = Some(names);
+                    }
+                    index.packages
+                } else {
+                    sample_packages(
+                        &index,
+                        args.sample.context("Missing sample size")? as usize,
+                        seed.context("Missing sample seed")?,
+                    )
+                }
             }
-            index.packages
-        } else {
-            sample_packages(
-                &index,
-                args.sample.context("Missing sample size")? as usize,
-                seed.context("Missing sample seed")?,
-            )
+            // An interrupted root listing is not authoritative. Save an empty
+            // partial report without pruning; the project count is unknown.
+            Err(_) if interrupt.is_interrupted() => Vec::new(),
+            Err(error) => return Err(error),
         }
     } else {
         let names = if let Some(path) = &args.packages_file {
@@ -354,6 +380,8 @@ fn run_inner(
     };
     let mut report = CheckReport {
         mirror_root: PathBuf::from("."),
+        stale_temp_files_removed: _lock.stale_temp_files_removed,
+        stopped: None,
         metadata_concurrency: metadata_options.concurrency,
         seed,
         selection,
@@ -389,6 +417,7 @@ fn run_inner(
                 quiet,
                 no_progress,
                 json: args.json,
+                interrupt,
             },
         );
     }
@@ -403,6 +432,9 @@ fn run_inner(
         &layout,
         &metadata_options,
         |name, result| {
+            if interrupt.is_interrupted() {
+                return Ok(false);
+            }
             match result {
                 Ok(MetadataOutcome::Available(metadata)) => {
                     report.checked += 1;
@@ -434,6 +466,10 @@ fn run_inner(
             Ok(true)
         },
     )?;
+    report.not_inspected = total.saturating_sub(completed);
+    report.stopped = interrupt.is_interrupted().then(|| "Interrupted".into());
+    report.stale_temp_files_removed += report.summary.stale_temp_files_removed;
+    snatchrs::cleanup::announce(report.stale_temp_files_removed, quiet);
     journal.packages.get_ref().sync_all()?;
     journal.errors.get_ref().sync_all()?;
     journal.unavailable.get_ref().sync_all()?;
@@ -499,6 +535,12 @@ fn run_inner(
         )?;
     }
     stdout.flush()?;
+    if interrupt.is_interrupted() {
+        anyhow::bail!(
+            "Interrupted. 0 queued files were not attempted and {} projects were not inspected. Completed files are kept; rerun to continue.",
+            report.not_inspected
+        );
+    }
     ensure!(
         report.error_count == 0 && report.summary.blocked == 0,
         "Inspection had {} package errors and {} blocked files; see {}",
@@ -525,10 +567,11 @@ struct MirrorDownloads<'a> {
     outcomes_path: PathBuf,
 }
 
-struct OutputOptions {
+struct OutputOptions<'a> {
     quiet: bool,
     no_progress: bool,
     json: bool,
+    interrupt: &'a snatchrs::interrupt::StopToken,
 }
 
 fn run_pipeline(
@@ -538,12 +581,13 @@ fn run_pipeline(
     inspection: (CheckReport, InspectionJournal, Option<HashSet<String>>),
     metadata_options: MetadataOptions,
     options: snatchrs::download::DownloadOptions,
-    output: OutputOptions,
+    output: OutputOptions<'_>,
 ) -> Result<()> {
     let OutputOptions {
         quiet,
         no_progress,
         json,
+        interrupt,
     } = output;
     let (inspection, journal, authoritative_names) = inspection;
     let outcomes_path = inspection
@@ -571,9 +615,10 @@ fn run_pipeline(
     let mut log_time = Instant::now();
     let mut checkpoint_error = None;
     let mut stop_announced = false;
-    let downloaded = snatchrs::download::download_stream_to(
+    let downloaded = snatchrs::download::download_stream_to_interruptible(
         &layout.root,
         options,
+        interrupt,
         |queue| {
             let report = if let Some(reason) = &outcome_open_error {
                 let mut report = inspection;
@@ -669,6 +714,11 @@ fn run_pipeline(
         inspection.queue_error.get_or_insert(reason.clone());
         downloads.progress.stopped.get_or_insert(reason);
     }
+    if interrupt.is_interrupted() {
+        downloads.progress.stopped = Some("Interrupted".into());
+        inspection.stopped = Some("Interrupted".into());
+    }
+    snatchrs::cleanup::announce(inspection.stale_temp_files_removed, quiet);
     downloads.progress.discovery.total_packages = inspection.checked
         + inspection.error_count
         + inspection.unavailable_count
@@ -701,7 +751,9 @@ fn run_pipeline(
     }
     // Reaching the final pass means the root listing was fetched completely.
     // Per-project failures do not weaken its authority about deleted projects.
-    if let Some(names) = authoritative_names {
+    if !interrupt.is_interrupted()
+        && let Some(names) = authoritative_names
+    {
         match snatchrs::simple::project_names(&layout.root) {
             Ok(projects) => {
                 for name in projects {
@@ -755,6 +807,13 @@ fn run_pipeline(
     }
     stdout.flush()?;
     if let Some(reason) = &downloads.progress.stopped {
+        if reason == "Interrupted" {
+            anyhow::bail!(
+                "Interrupted. {} queued files were not attempted and {} projects were not inspected. Completed files are kept; rerun to continue.",
+                downloads.progress.not_attempted,
+                inspection.not_inspected
+            );
+        }
         let stopped = if stop_announced {
             "Stopped".to_owned()
         } else {
@@ -817,6 +876,11 @@ fn stop_inspection(
     journal: &mut InspectionJournal,
     reason: String,
 ) {
+    if reason == "Interrupted" {
+        report.stopped = Some(reason.clone());
+        queue.stop(reason);
+        return;
+    }
     if report.queue_error.is_none() {
         report.queue_error = Some(reason.clone());
         // An exhausted filesystem may also reject this journal append. Keep
@@ -851,6 +915,10 @@ fn inspect_stream(
             layout,
             &metadata_options,
             |name, result| {
+                if metadata_options.interrupt.is_interrupted() {
+                    stop_inspection(queue, &mut report, &mut journal, "Interrupted".into());
+                    return Ok(false);
+                }
                 if let Some(reason) = queue.stop_reason() {
                     stop_inspection(queue, &mut report, &mut journal, reason);
                     return Ok(false);
@@ -924,6 +992,10 @@ fn inspect_stream(
         stop_inspection(queue, &mut report, &mut journal, format!("{error:#}"));
     }
     report.not_inspected = total.saturating_sub(completed);
+    report.stale_temp_files_removed += report.summary.stale_temp_files_removed;
+    if metadata_options.interrupt.is_interrupted() {
+        stop_inspection(queue, &mut report, &mut journal, "Interrupted".into());
+    }
     let saved = (|| -> Result<()> {
         journal.packages.get_ref().sync_all()?;
         journal.errors.get_ref().sync_all()?;
@@ -967,6 +1039,7 @@ mod tests {
             base: "http://127.0.0.1:1/simple/".parse().unwrap(),
             refresh: false,
             concurrency: 2,
+            interrupt: Default::default(),
         };
         for fail in [false, true] {
             let mut consumed = 0;

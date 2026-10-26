@@ -409,6 +409,11 @@ fn project_404_is_not_retried_and_later_projects_are_still_checked() {
                 "--json",
                 "--quiet",
             ])
+            .args(if mode == "mirror" {
+                &["--min-free", "0"][..]
+            } else {
+                &[]
+            })
             .arg(root.path())
             .output()
             .unwrap();

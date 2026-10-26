@@ -316,8 +316,21 @@ Automatic HTTP decompression is disabled. Expected byte size and SHA256 (when
 provided by PyPI) must match before a file is atomically published. A failed
 replacement leaves the previous file intact. Artifacts are stored as bytes and
 are never installed, imported, or extracted. A failed command can be rerun to skip
-completed files; partial downloads restart from zero. Interrupted processes may
-leave hidden temporary files, which are never treated as completed artifacts.
+completed files; partial downloads restart from zero.
+
+The first Ctrl-C (also SIGTERM or SIGHUP) stops discovery and hashing, cancels
+in-flight downloads, restores the terminal, and saves reports before exiting
+with code **130**. Completed files are kept; rerun the same command to continue.
+A second signal exits immediately with code 130. `index` retains its default
+immediate signal handling.
+
+After taking the mirror lock, commands automatically remove stale regular files
+whose names start with `.snatchrs-` in the root, metadata, Simple index, and report
+directories. Each project's package and Simple directories are cleaned when that
+project is processed, without walking the entire mirror. Symlinks, directories,
+and `.snatchrs.lock` are kept. Cleanup is best-effort; failures produce warnings.
+The removed count is recorded as `stale_temp_files_removed` in check/mirror
+inspection and verify reports, and in the `simple` summary.
 
 Workers reserve space for active transfers, including replacements, while always
 leaving `--min-free SIZE` free (default `1G`). Sizes accept plain bytes or binary

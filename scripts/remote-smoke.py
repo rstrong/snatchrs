@@ -49,7 +49,8 @@ def main():
             common = [str(root), "--package", "remote-smoke", "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/", "--json"]
 
             def run(command, *extra):
-                result = subprocess.run([str(args.binary.resolve()), command, *common, *extra], capture_output=True, text=True, timeout=30)
+                storage = ["--min-free", "0"] if command == "mirror" else []
+                result = subprocess.run([str(args.binary.resolve()), command, *common, *storage, *extra], capture_output=True, text=True, timeout=30)
                 if result.returncode:
                     raise RuntimeError(result.stderr)
                 return json.loads(result.stdout)
@@ -101,7 +102,7 @@ def main():
             # Prove the deployed CLI accepts large sample counts without making
             # any PyPI requests: this local index contains one fixture project.
             result = subprocess.run([
-                str(args.binary.resolve()), "mirror", "--sample", "10000",
+                str(args.binary.resolve()), "mirror", "--min-free", "0", "--sample", "10000",
                 str(root), "--index-url", f"http://127.0.0.1:{server.server_port}/simple/",
                 "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/", "--json"
             ], capture_output=True, text=True, timeout=30)

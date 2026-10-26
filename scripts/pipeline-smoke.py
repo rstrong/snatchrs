@@ -101,7 +101,7 @@ def main():
         packages = ["early", "existing", "later"] if args.check_ahead else ["early", "later"]
         selection = [arg for name in packages for arg in ("--package", name)]
         process = subprocess.Popen([
-            str(args.binary.resolve()), "mirror", str(root),
+            str(args.binary.resolve()), "mirror", str(root), "--min-free", "0",
             *selection, "--concurrency", "2",
             "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/"
         ], stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,

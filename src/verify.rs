@@ -61,6 +61,8 @@ enum State {
 
 #[derive(Default, Serialize)]
 struct VerifyReport {
+    stale_temp_files_removed: usize,
+    stopped: Option<String>,
     projects: usize,
     files: usize,
     bytes_hashed: u64,
@@ -126,6 +128,7 @@ impl Outcome {
 }
 enum Event {
     Project,
+    Swept(usize),
     ProjectError(Problem),
     Bytes(u64),
     File { job: Box<Job>, outcome: Outcome },
@@ -220,6 +223,7 @@ fn verify_file(
     remove_bad: bool,
     buffer: &mut [u8],
     mut bytes: impl FnMut(u64),
+    interrupt: &snatchrs::interrupt::StopToken,
 ) -> Outcome {
     let path = match safe_path(root, job) {
         Ok(path) => path,
@@ -260,6 +264,7 @@ fn verify_file(
         let mut digest = Sha256::new();
         let mut read = 0u64;
         loop {
+            interrupt.check()?;
             let size = file.read(buffer)?;
             if size == 0 {
                 break;
@@ -283,7 +288,7 @@ fn verify_file(
         State::HashMismatch,
         format!("Expected SHA256 {expected}, found {actual}"),
     );
-    if remove_bad {
+    if remove_bad && !interrupt.is_interrupted() {
         // Recheck the path and identity after hashing, so replacing a file or
         // swapping in a symlink cannot make us delete a different object.
         let removed = (|| -> Result<()> {
@@ -311,11 +316,13 @@ fn produce(
     jobs: mpsc::SyncSender<Job>,
     events: mpsc::SyncSender<Event>,
     cancelled: &AtomicBool,
+    interrupt: &snatchrs::interrupt::StopToken,
 ) {
     let send_project = |name: String| -> Result<()> {
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.load(Ordering::Acquire) || interrupt.is_interrupted() {
             return Ok(());
         }
+        events.send(Event::Swept(snatchrs::cleanup::sweep_project(root, &name)))?;
         events.send(Event::Project)?;
         match load_metadata(root, &name) {
             Ok(metadata) => {
@@ -324,7 +331,7 @@ fn produce(
                     .into_iter()
                     .flat_map(|release| release.files)
                 {
-                    if cancelled.load(Ordering::Acquire) {
+                    if cancelled.load(Ordering::Acquire) || interrupt.is_interrupted() {
                         break;
                     }
                     jobs.send(Job {
@@ -350,14 +357,14 @@ fn produce(
         );
         if !names.is_empty() {
             for name in names {
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.load(Ordering::Acquire) || interrupt.is_interrupted() {
                     break;
                 }
                 send_project(name)?;
             }
         } else {
             for entry in fs::read_dir(root.join("metadata"))? {
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.load(Ordering::Acquire) || interrupt.is_interrupted() {
                     break;
                 }
                 let entry = entry?;
@@ -380,7 +387,9 @@ fn produce(
         }
         Ok(())
     })();
-    if let Err(error) = produced {
+    if let Err(error) = produced
+        && !interrupt.is_interrupted()
+    {
         let _ = events.send(Event::ProjectError(project_problem(
             "<metadata>",
             "metadata".into(),
@@ -396,7 +405,12 @@ fn append_problem(writer: &mut BufWriter<File>, problem: &Problem) -> Result<()>
     Ok(())
 }
 
-pub fn run(args: VerifyArgs, quiet: bool, no_progress: bool) -> Result<()> {
+pub fn run(
+    args: VerifyArgs,
+    quiet: bool,
+    no_progress: bool,
+    interrupt: &snatchrs::interrupt::StopToken,
+) -> Result<()> {
     let names = normalize_names(args.packages)?;
     let root = args
         .mirror
@@ -420,6 +434,7 @@ pub fn run(args: VerifyArgs, quiet: bool, no_progress: bool) -> Result<()> {
         .keep();
     let mut problems = BufWriter::new(File::create(run.join("problems.jsonl"))?);
     let mut report = VerifyReport {
+        stale_temp_files_removed: _lock.stale_temp_files_removed,
         problems_path: run.strip_prefix(&layout.root)?.join("problems.jsonl"),
         ..Default::default()
     };
@@ -441,8 +456,8 @@ pub fn run(args: VerifyArgs, quiet: bool, no_progress: bool) -> Result<()> {
         let producer_events = sent_events.clone();
         let root = &layout.root;
         let cancel = &cancelled;
-        let producer =
-            scope.spawn(move || produce(root, names, sent_jobs, producer_events, cancel));
+        let producer = scope
+            .spawn(move || produce(root, names, sent_jobs, producer_events, cancel, interrupt));
         let mut workers = Vec::new();
         for _ in 0..args.concurrency {
             let jobs = jobs.clone();
@@ -450,13 +465,23 @@ pub fn run(args: VerifyArgs, quiet: bool, no_progress: bool) -> Result<()> {
             let cancel = &cancelled;
             workers.push(scope.spawn(move || {
                 let mut buffer = vec![0; 1024 * 1024];
-                while !cancel.load(Ordering::Acquire) {
+                while !cancel.load(Ordering::Acquire) && !interrupt.is_interrupted() {
                     let Ok(job) = jobs.lock().unwrap_or_else(|p| p.into_inner()).recv() else {
                         break;
                     };
-                    let outcome = verify_file(root, &job, args.remove_bad, &mut buffer, |bytes| {
-                        let _ = events.send(Event::Bytes(bytes));
-                    });
+                    let outcome = verify_file(
+                        root,
+                        &job,
+                        args.remove_bad,
+                        &mut buffer,
+                        |bytes| {
+                            let _ = events.send(Event::Bytes(bytes));
+                        },
+                        interrupt,
+                    );
+                    if interrupt.is_interrupted() && outcome.state == State::Error {
+                        break;
+                    }
                     if events
                         .send(Event::File {
                             job: Box::new(job),
@@ -473,6 +498,10 @@ pub fn run(args: VerifyArgs, quiet: bool, no_progress: bool) -> Result<()> {
         drop(sent_events);
         for event in events {
             let problem = match event {
+                Event::Swept(count) => {
+                    report.stale_temp_files_removed += count;
+                    None
+                }
                 Event::Project => {
                     report.projects += 1;
                     None
@@ -584,6 +613,8 @@ pub fn run(args: VerifyArgs, quiet: bool, no_progress: bool) -> Result<()> {
     if let Some(bar) = bar {
         bar.finish_and_clear();
     }
+    report.stopped = interrupt.is_interrupted().then(|| "Interrupted".into());
+    snatchrs::cleanup::announce(report.stale_temp_files_removed, quiet);
     let path = layout.root.join("verify-report.json");
     write_json(&path, &report)?;
     let repair = if report.removed > 0 {

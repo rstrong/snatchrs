@@ -147,7 +147,7 @@ fn states_selection_and_safe_removal() {
         b"x"
     );
     assert_eq!(fs::read(temp.path().join("target")).unwrap(), b"good");
-    assert!(root.join("packages/example/.snatchrs-stale").exists());
+    assert!(!root.join("packages/example/.snatchrs-stale").exists());
     assert!(
         !fs::read_to_string(root.join("simple/example/index.html"))
             .unwrap()

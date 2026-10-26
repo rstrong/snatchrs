@@ -91,6 +91,9 @@ impl Server {
     fn mirror(&self, root: &Path, names: &[String], extra: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_snatchrs"));
         command.arg("mirror").arg(root);
+        if !extra.contains(&"--min-free") {
+            command.args(["--min-free", "0"]);
+        }
         for name in names {
             command.args(["--package", name]);
         }

@@ -1,7 +1,7 @@
 //! Shared transport defaults for discovery, metadata, and artifact clients.
 use std::{
     error::Error as _,
-    fmt, io, thread,
+    fmt, io,
     time::{Duration, SystemTime},
 };
 
@@ -83,6 +83,21 @@ pub(crate) fn check_response(response: Response) -> Result<Response> {
     Ok(response)
 }
 
+pub(crate) fn check_async_response(response: reqwest::Response) -> Result<reqwest::Response> {
+    if let Err(error) = response.error_for_status_ref() {
+        let delay = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| retry_after(value, SystemTime::now()));
+        return Err(if transient_status(response.status()) {
+            transient(error.into(), delay)
+        } else {
+            error.into()
+        });
+    }
+    Ok(response)
+}
+
 fn transient_io(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -133,10 +148,11 @@ pub(crate) fn request_error(error: reqwest::Error) -> Error {
     }
 }
 
-/// Called only for response reads, never for filesystem writes. Local disk
-/// errors remain unmarked and therefore cannot trigger network retries.
-pub(crate) fn read_error(error: io::Error) -> Error {
-    metadata_error(error.into())
+// Raw artifact chunks have decompression disabled, so a chunk/decode error
+// here is a transport failure (including premature EOF), not invalid JSON or
+// a local filesystem error.
+pub(crate) fn body_error(error: reqwest::Error) -> Error {
+    transient(error.into(), None)
 }
 
 pub(crate) fn json_error(error: serde_json::Error) -> Error {
@@ -198,9 +214,14 @@ pub(crate) fn retry_delay(attempt: u32, attempts: u32, error: &Error) -> Option<
     )
 }
 
-pub(crate) fn retry<T>(attempts: u32, mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+pub(crate) fn retry<T>(
+    attempts: u32,
+    interrupt: &crate::interrupt::StopToken,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
     let mut attempt = 1;
     loop {
+        interrupt.check()?;
         match operation() {
             Ok(value) => return Ok(value),
             Err(error) => {
@@ -209,7 +230,9 @@ pub(crate) fn retry<T>(attempts: u32, mut operation: impl FnMut() -> Result<T>) 
                         error.context(format!("HTTP operation failed after {attempt} attempt(s)"))
                     );
                 };
-                thread::sleep(delay);
+                if !interrupt.wait(delay) {
+                    interrupt.check()?;
+                }
                 attempt += 1;
             }
         }
@@ -221,9 +244,10 @@ pub(crate) fn get<T>(
     url: &url::Url,
     accept: &str,
     attempts: u32,
+    interrupt: &crate::interrupt::StopToken,
     mut decode: impl FnMut(Response) -> Result<T>,
 ) -> Result<T> {
-    retry(attempts, || {
+    retry(attempts, interrupt, || {
         let response = client
             .get(url.clone())
             .header(reqwest::header::ACCEPT, accept)
@@ -237,6 +261,7 @@ pub(crate) fn get<T>(
 mod tests {
     use super::*;
     use rand::{SeedableRng, rngs::StdRng};
+    use std::thread;
 
     #[test]
     fn statuses_and_local_failures_are_classified_without_retrying_permanent_errors() {
@@ -339,9 +364,14 @@ mod tests {
             .timeout(Duration::from_millis(250))
             .build()
             .unwrap();
-        let result: serde_json::Value = get(&client, &url, "application/json", 2, |response| {
-            serde_json::from_reader(response).map_err(json_error)
-        })
+        let result: serde_json::Value = get(
+            &client,
+            &url,
+            "application/json",
+            2,
+            &crate::interrupt::StopToken::default(),
+            |response| serde_json::from_reader(response).map_err(json_error),
+        )
         .unwrap();
         server.join().unwrap();
         assert_eq!(result, serde_json::json!([]));

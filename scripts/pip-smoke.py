@@ -118,10 +118,10 @@ def main():
             root = Path(directory) / "mirror"
             with serving(Origin) as origin:
                 report = json.loads(run([
-                    str(args.binary.resolve()), "mirror", str(root), "--sample", "1", "--seed", "42",
+                    str(args.binary.resolve()), "mirror", str(root), "--min-free", "0", "--sample", "1", "--seed", "42",
                     "--index-url", f"http://127.0.0.1:{origin.server_port}/simple/", "--json", "--quiet",
                 ], env=env))
-                assert report["simple_index"] == {"projects": 1, "files_linked": 1, "files_skipped": 0, "projects_removed": 0, "page_errors": 0, "errors": []}, report
+                assert report["simple_index"] == {"projects": 1, "files_linked": 1, "files_skipped": 0, "projects_removed": 0, "page_errors": 0, "errors": [], "stale_temp_files_removed": 0}, report
             # The origin has stopped: pip can only succeed via generated static
             # pages and mirrored bytes, never by following an upstream URL.
             requests = []

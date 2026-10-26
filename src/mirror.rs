@@ -181,6 +181,7 @@ impl IndexClient {
             &url,
             JSON_MEDIA_TYPE,
             self.attempts,
+            &self.interrupt,
             |response| {
                 let effective_url = response.url().clone();
                 let header_serial = response
@@ -204,9 +205,14 @@ pub struct MirrorLayout {
     pub root: PathBuf,
 }
 
+pub struct MirrorLock {
+    _file: fs::File,
+    pub stale_temp_files_removed: usize,
+}
+
 impl MirrorLayout {
     /// Keep metadata writers and downloaders from overlapping in the same root.
-    pub fn lock(&self) -> Result<fs::File> {
+    pub fn lock(&self) -> Result<MirrorLock> {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -215,7 +221,14 @@ impl MirrorLayout {
             .open(self.root.join(".snatchrs.lock"))?;
         file.try_lock()
             .context("Another snatchrs command is using this mirror")?;
-        Ok(file)
+        let stale_temp_files_removed = ["", "metadata", "simple", "reports"]
+            .into_iter()
+            .map(|name| crate::cleanup::sweep_directory(&self.root.join(name)))
+            .sum();
+        Ok(MirrorLock {
+            _file: file,
+            stale_temp_files_removed,
+        })
     }
     pub fn create(root: &Path) -> Result<Self> {
         fs::create_dir_all(root)
@@ -387,6 +400,7 @@ pub struct CheckedPackage {
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct CheckSummary {
+    pub stale_temp_files_removed: usize,
     pub packages: usize,
     pub releases: usize,
     pub files: usize,
@@ -402,6 +416,8 @@ pub fn check_package(
     metadata: PackageMetadata,
     summary: &mut CheckSummary,
 ) -> CheckedPackage {
+    summary.stale_temp_files_removed +=
+        crate::cleanup::sweep_project(root, &metadata.package.normalized_name);
     summary.packages += 1;
     summary.releases += metadata.releases.len();
     let mut files = Vec::new();

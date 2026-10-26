@@ -105,6 +105,11 @@ impl Server {
     fn command(&self, root: &Path, mode: &str, selection: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_snatchrs"))
             .arg(mode)
+            .args(if mode == "mirror" {
+                &["--min-free", "0"][..]
+            } else {
+                &[]
+            })
             .arg(root)
             .args(selection)
             .args([

@@ -60,26 +60,31 @@ enum Command {
     },
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli, interrupt: &snatchrs::interrupt::StopToken) -> Result<()> {
     let start = Instant::now();
     let (index_url, from_file, json) = match cli.command {
         Command::Mirror(args) => {
-            return check::run_mirror(args, cli.quiet, cli.no_progress, cli.attempts);
+            return check::run_mirror(args, cli.quiet, cli.no_progress, cli.attempts, interrupt);
         }
-        Command::Check(args) => return check::run(args, cli.quiet, cli.no_progress, cli.attempts),
-        Command::Verify(args) => return verify::run(args, cli.quiet, cli.no_progress),
+        Command::Check(args) => {
+            return check::run(args, cli.quiet, cli.no_progress, cli.attempts, interrupt);
+        }
+        Command::Verify(args) => return verify::run(args, cli.quiet, cli.no_progress, interrupt),
         Command::Simple { mirror } => {
             let layout = snatchrs::mirror::MirrorLayout::create(&mirror)?;
             let _lock = layout.lock()?;
-            let summary = snatchrs::simple::regenerate(&layout.root)?;
+            let mut summary = snatchrs::simple::regenerate_interruptible(&layout.root, interrupt)?;
+            summary.stale_temp_files_removed += _lock.stale_temp_files_removed;
+            snatchrs::cleanup::announce(summary.stale_temp_files_removed, cli.quiet);
             let mut stdout = io::BufWriter::new(io::stdout().lock());
             writeln!(
                 stdout,
-                "Simple index: {} projects written · {} files linked · {} files skipped as not present · {} projects removed",
+                "Simple index: {} projects written · {} files linked · {} files skipped as not present · {} projects removed · {} stale temporary files removed",
                 summary.projects,
                 summary.files_linked,
                 summary.files_skipped,
-                summary.projects_removed
+                summary.projects_removed,
+                summary.stale_temp_files_removed
             )?;
             stdout.flush()?;
             ensure!(summary.page_errors == 0, "{}", summary.failure_message());
@@ -140,7 +145,30 @@ fn interactive(quiet: bool, no_progress: bool, json: bool) -> bool {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let interrupt = snatchrs::interrupt::StopToken::default();
+    if !matches!(&cli.command, Command::Index { .. }) {
+        let signal = interrupt.clone();
+        if let Err(error) = ctrlc::set_handler(move || {
+            if !signal.interrupt() {
+                eprintln!("Interrupted again; exiting immediately");
+                std::process::exit(130);
+            }
+        }) {
+            eprintln!("error: cannot install signal handler: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let result = run(cli, &interrupt);
+    if interrupt.is_interrupted() {
+        if let Err(error) = result {
+            eprintln!("{error:#}");
+        } else {
+            eprintln!("Interrupted. Completed files are kept; rerun to continue.");
+        }
+        return ExitCode::from(130);
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error)
             if error.chain().any(|cause| {

@@ -165,6 +165,8 @@ fn mirror(root: &Path, base: &str, metadata: &str) -> Command {
     command
         .args([
             "mirror",
+            "--min-free",
+            "0",
             "--sample",
             "1",
             "--seed",

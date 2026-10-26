@@ -1,5 +1,14 @@
 use std::process::Command;
 
+fn command(mode: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_snatchrs"));
+    command.arg(mode);
+    if mode == "mirror" {
+        command.args(["--min-free", "0"]);
+    }
+    command
+}
+
 #[test]
 fn redirected_output_stays_plain_and_quiet_suppresses_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
@@ -44,8 +53,8 @@ fn mirror_check_and_simple_require_a_directory() {
         vec!["simple"],
         vec!["mirror"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
-            .args(arguments)
+        let output = command(arguments[0])
+            .args(&arguments[1..])
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
@@ -58,8 +67,7 @@ fn selection_is_explicit_exclusive_and_seed_requires_sample() {
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("not-created");
     for mode in ["mirror", "check"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
-            .arg(mode)
+        let output = command(mode)
             .arg(&destination)
             .args([
                 "--index-url",
@@ -82,8 +90,7 @@ fn selection_is_explicit_exclusive_and_seed_requires_sample() {
         ];
         for (i, first) in selections.iter().enumerate() {
             for second in selections.iter().skip(i + 1) {
-                let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
-                    .arg(mode)
+                let output = command(mode)
                     .arg(&destination)
                     .args(first)
                     .args(second)
@@ -99,8 +106,7 @@ fn selection_is_explicit_exclusive_and_seed_requires_sample() {
             }
         }
         for selection in [&["--all"][..], &["--package", "pkg"][..], &[][..]] {
-            let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
-                .arg(mode)
+            let output = command(mode)
                 .arg(&destination)
                 .args(selection)
                 .args(["--seed", "42"])
@@ -123,8 +129,7 @@ fn selection_is_explicit_exclusive_and_seed_requires_sample() {
 fn removed_flags_are_not_retained_as_aliases() {
     let root = tempfile::tempdir().unwrap();
     for flag in ["--mirror", "--threads"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
-            .arg("mirror")
+        let output = command("mirror")
             .arg(root.path())
             .args(["--package", "pkg", flag, "unused"])
             .output()

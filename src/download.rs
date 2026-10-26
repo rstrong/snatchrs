@@ -2,16 +2,17 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
+use crate::interrupt::StopToken;
 use crate::mirror::CheckedPackage;
 use anyhow::{Context, Result, ensure};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -694,6 +695,7 @@ pub fn download_all(
         root,
         options,
         options.concurrency.min(tasks.len()),
+        &StopToken::default(),
         |queue| {
             for task in tasks {
                 if let Err(error) = queue.enqueue(task.clone()) {
@@ -719,7 +721,15 @@ pub fn download_stream<T: Send>(
     producer: impl FnOnce(&mut DownloadQueue) -> Result<T> + Send,
     progress: impl FnMut(&DownloadProgress),
 ) -> Result<(T, DownloadReport)> {
-    stream_with_workers(root, options, options.concurrency, producer, progress, None)
+    stream_with_workers(
+        root,
+        options,
+        options.concurrency,
+        &StopToken::default(),
+        producer,
+        progress,
+        None,
+    )
 }
 
 /// Stream completed outcomes to a fallible sink instead of retaining them in RAM.
@@ -736,6 +746,27 @@ pub fn download_stream_to<T: Send>(
         root,
         options,
         options.concurrency,
+        &StopToken::default(),
+        producer,
+        progress,
+        Some(&mut outcome),
+    )
+}
+
+/// Interruptible variant for executables with their own signal handler.
+pub fn download_stream_to_interruptible<T: Send>(
+    root: &Path,
+    options: DownloadOptions,
+    interrupt: &StopToken,
+    producer: impl FnOnce(&mut DownloadQueue) -> Result<T> + Send,
+    progress: impl FnMut(&DownloadProgress),
+    mut outcome: impl FnMut(&DownloadOutcome) -> Result<()>,
+) -> Result<(T, DownloadReport)> {
+    stream_with_workers(
+        root,
+        options,
+        options.concurrency,
+        interrupt,
         producer,
         progress,
         Some(&mut outcome),
@@ -748,6 +779,7 @@ fn stream_with_workers<T: Send>(
     root: &Path,
     options: DownloadOptions,
     worker_count: usize,
+    interrupt: &StopToken,
     producer: impl FnOnce(&mut DownloadQueue) -> Result<T> + Send,
     mut progress: impl FnMut(&DownloadProgress),
     mut outcome_sink: Option<&mut OutcomeSink<'_>>,
@@ -761,19 +793,13 @@ fn stream_with_workers<T: Send>(
         "Download attempts must be between 1 and 10"
     );
     let root = root.canonicalize()?;
-    // Configure per-read stalls on the async transport, then disable the
-    // blocking wrapper's separate timeout so active large files can finish.
-    let client = reqwest::blocking::ClientBuilder::from(
-        crate::http::transport_builder()
-            .gzip(false)
-            .read_timeout(options.read_timeout),
-    )
-    .timeout(None)
-    .build()?;
-    // The blocking response polls the async read-timeout timer on each worker.
     let read_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
-        .enable_time()
+        .enable_all()
+        .build()?;
+    let client = crate::http::transport_builder()
+        .gzip(false)
+        .read_timeout(options.read_timeout)
         .build()?;
     let mut state = DownloadProgress {
         discovery: DiscoveryProgress::default(),
@@ -818,8 +844,11 @@ fn stream_with_workers<T: Send>(
             let budget = &budget;
             let read_runtime = &read_runtime;
             handles.push(scope.spawn(move || -> Result<()> {
-                let _runtime = read_runtime.enter();
                 loop {
+                    if interrupt.is_interrupted() {
+                        jobs.stop("Interrupted".into());
+                        break;
+                    }
                     let task = match jobs.next() {
                         Ok(Some(task)) => task,
                         Ok(None) => break,
@@ -855,9 +884,15 @@ fn stream_with_workers<T: Send>(
                         }
                         let result = reserve_space(root, budget, &task.local_path, task.size)
                             .and_then(|_reservation| {
-                                download_one(client, root, &task, |bytes| {
-                                    let _ = events.send(Event::Bytes { worker, bytes });
-                                })
+                                read_runtime.block_on(interrupt.run(download_one(
+                                    client,
+                                    root,
+                                    &task,
+                                    interrupt,
+                                    |bytes| {
+                                        let _ = events.send(Event::Bytes { worker, bytes });
+                                    },
+                                )))
                             });
                         match result {
                             Ok(()) => {
@@ -867,6 +902,11 @@ fn stream_with_workers<T: Send>(
                                 break;
                             }
                             Err(error) => {
+                                if interrupt.is_interrupted() {
+                                    jobs.stop("Interrupted".into());
+                                    abandoned = true;
+                                    break;
+                                }
                                 let error = storage_error(
                                     error,
                                     &root.join(&task.local_path),
@@ -898,6 +938,7 @@ fn stream_with_workers<T: Send>(
                                     return Ok(());
                                 }
                                 if !budget.retry_wait(delay) {
+                                    abandoned = interrupt.is_interrupted();
                                     break;
                                 }
                             }
@@ -929,6 +970,10 @@ fn stream_with_workers<T: Send>(
         });
         drop(events);
         loop {
+            if interrupt.is_interrupted() {
+                controller.stop("Interrupted".into());
+                state.stopped = Some("Interrupted".into());
+            }
             let event = match receiver.recv_timeout(Duration::from_millis(80)) {
                 Ok(event) => Some(event),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -1053,10 +1098,11 @@ fn stream_with_workers<T: Send>(
     ))
 }
 
-fn download_one(
+async fn download_one(
     client: &Client,
     root: &Path,
     task: &DownloadTask,
+    interrupt: &StopToken,
     mut progress: impl FnMut(u64),
 ) -> Result<()> {
     validate_path(root, task)?;
@@ -1075,8 +1121,9 @@ fn download_one(
         .get(task.download_url.clone())
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()
+        .await
         .map_err(crate::http::request_error)?;
-    let mut response = crate::http::check_response(response)?;
+    let mut response = crate::http::check_async_response(response)?;
     if let Some(length) = response.content_length() {
         ensure!(
             length == task.size,
@@ -1087,15 +1134,13 @@ fn download_one(
     let mut hasher = Sha256::new();
     let mut received = 0u64;
     let mut unreported = 0u64;
-    let mut buffer = [0u8; 65536];
-    let result = (|| -> Result<()> {
+    let result: Result<()> = async {
         loop {
-            let size = response
-                .read(&mut buffer)
-                .map_err(crate::http::read_error)?;
-            if size == 0 {
+            interrupt.check()?;
+            let Some(buffer) = response.chunk().await.map_err(crate::http::body_error)? else {
                 break;
-            }
+            };
+            let size = buffer.len();
             received += size as u64;
             unreported += size as u64;
             ensure!(received <= task.size, "Artifact exceeds expected size");
@@ -1119,6 +1164,7 @@ fn download_one(
                 task.filename
             );
         }
+        interrupt.check()?;
         temporary.as_file().sync_all()?;
         #[cfg(unix)]
         {
@@ -1129,7 +1175,8 @@ fn download_one(
         }
         temporary.persist(&path).map_err(|error| error.error)?;
         Ok(())
-    })();
+    }
+    .await;
     if unreported > 0 {
         progress(unreported);
     }
