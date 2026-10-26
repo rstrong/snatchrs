@@ -491,7 +491,6 @@ fn cli_saves_metadata_and_report_and_continues_after_unavailable_project() {
             "--metadata-url",
             &base,
             "--json",
-            "--mirror",
         ])
         .arg(directory.path())
         .output()
@@ -562,7 +561,6 @@ fn cli_saves_metadata_and_report_and_continues_after_unavailable_project() {
             "--metadata-url",
             &base,
             "--json",
-            "--mirror",
         ])
         .arg(directory.path())
         .output()

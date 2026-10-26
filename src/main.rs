@@ -18,14 +18,14 @@ mod progress;
 #[derive(Parser)]
 #[command(version, about = "Discover, inspect, and mirror PyPI packages")]
 struct Cli {
-    /// Suppress status messages (result output is still written).
+    /// Suppress status messages.
     #[arg(short, long, global = true)]
     quiet: bool,
-    /// Disable interactive terminal progress.
+    /// Disable interactive progress.
     #[arg(long, global = true)]
     no_progress: bool,
-    /// Maximum attempts per index/metadata request or file (including the first).
-    #[arg(long, global = true, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=10))]
+    /// Maximum attempts per request or download.
+    #[arg(long, value_name = "N", global = true, help_heading = "Advanced", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=10))]
     attempts: u32,
     #[command(subcommand)]
     command: Command,
@@ -33,24 +33,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Download all releases for a random project sample (default: 100).
+    /// Download projects and publish a static Simple index
     Mirror(check::MirrorArgs),
-    /// Inspect release metadata and local files for a small package sample.
+    /// Report which files are missing, without downloading
     Check(check::CheckArgs),
-    /// Regenerate static HTML Simple Index pages from saved metadata.
+    /// Rebuild the static Simple index from saved metadata
     Simple {
-        #[arg(long, default_value = "mirror-shell")]
+        /// Mirror directory.
+        #[arg(value_name = "DIR")]
         mirror: PathBuf,
     },
     /// Load the Simple Index and list its packages.
     Index {
-        #[arg(long, default_value = DEFAULT_INDEX_URL)]
+        /// Root Simple Index URL.
+        #[arg(long, value_name = "URL", default_value = DEFAULT_INDEX_URL, help_heading = "Advanced")]
         index_url: Url,
-        /// Read a saved Simple Index JSON response without using the network.
+        /// Read a saved index file.
         #[arg(long)]
         from_file: Option<PathBuf>,
-        /// Print the complete structured index as JSON.
-        #[arg(long)]
+        /// Print the index as JSON.
+        #[arg(long, help_heading = "Advanced")]
         json: bool,
     },
 }

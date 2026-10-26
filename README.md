@@ -15,17 +15,70 @@ Install stable Rust, then run these commands from the project directory:
 cargo build --release --locked
 
 # Check one package against local files, without downloading anything.
-./target/release/snatchrs check --mirror ./mirror-shell --package packaging
+./target/release/snatchrs check ./mirror --package packaging
 
 # Download its missing or wrong-sized files with four concurrent workers.
-./target/release/snatchrs mirror --mirror ./mirror-shell --package packaging --concurrency 4
+./target/release/snatchrs mirror ./mirror --package packaging --concurrency 4
 ```
 
-Files, metadata, and static HTML Simple Index pages are saved under `./mirror-shell`,
+Files, metadata, and static HTML Simple Index pages are saved under `./mirror`,
 with live terminal progress. See [Serving the mirror](#serving-the-mirror) for nginx,
 pip, and uv setup.
 All releases of the selected package are included. To select 100 random packages,
 replace `--package packaging` with `--sample 100`.
+
+## Choosing what to mirror
+
+`mirror` and `check` require an explicit directory and exactly one selection mode.
+There is no default directory or random sample. `simple` also requires a directory.
+
+```bash
+snatchrs mirror ./mirror --all
+snatchrs mirror ./mirror --package requests --package numpy
+snatchrs mirror ./mirror --packages-file packages.txt
+snatchrs mirror ./mirror --sample 100 --seed 42
+snatchrs check ./mirror --packages-file packages.txt
+snatchrs simple ./mirror
+```
+
+- `--all` selects every project in root-index order. Full PyPI is **many tens of
+  TB**; choose storage and bandwidth accordingly before requesting a full mirror.
+- Repeat `--package NAME` for explicit names; normalization and deduplication keep
+  the first occurrence. This mode never requests the root index.
+- `--packages-file PATH` reads one leading project name per line, ignoring blank
+  lines and whole-line or trailing `#` comments. Extras, version constraints,
+  markers, and direct URLs after the name are ignored. Names are normalized and
+  deduplicated in first-seen order. This mode also skips the root index; an empty
+  or comment-only file is an error.
+- `--sample N` explicitly requests a random sample; `--seed` is accepted only
+  with this mode. Selection is without replacement and limited by the index size.
+
+A packages file can contain requirements-like lines:
+
+```text
+requests>=2.0
+Foo[bar]==1; python_version<"3.9"
+name @ https://example.org/name.whl
+```
+
+**All versions** of each named project are mirrored, regardless of constraints,
+extras, markers, or URLs in the file. Dependencies are **not resolved**. This is
+not a full requirements parser: lines starting with pip options such as `-r` or
+`-e`, and lines without a valid project name, fail with their line number.
+
+`mirror DIR --all` treats a successfully fetched root listing as authoritative:
+existing project pages absent from that listing and their metadata caches are
+removed during the final pass, even when individual metadata requests or downloads
+failed. Those failures still produce a nonzero exit, but projects remaining in the
+listing are not pruned. Runs that abort before the final pass skip pruning.
+Downloaded files under `packages/` are always preserved. Other selection modes
+never prune unselected projects, and `check` never changes public Simple Index
+pages. Metadata 404s for selected projects retain their existing separate
+unavailable-project handling.
+
+The main options are selection, `--seed`, `-j/--concurrency` (default 8), `--quiet`,
+and `--no-progress`. Less common controls are under **Advanced** in help:
+metadata workers default to 4 and attempts default to 3.
 
 In an interactive terminal, `snatchrs index` displays an animated dashboard:
 bytes read while decoding JSON, followed by a package progress bar, processed and
@@ -100,23 +153,23 @@ packages with release and file metadata as described below.
 ## Inspect a mirror shell
 
 ```bash
-# Discover all project names, then inspect ten random packages (the default).
-cargo run --release -- check --mirror mirror-shell
+# Discover project names, then explicitly sample ten packages.
+cargo run --release -- check ./mirror --sample 10
 
 # Record/repeat the random selection, given the same root index.
-./target/release/snatchrs check --mirror mirror-shell --sample 10 --seed 42
+./target/release/snatchrs check ./mirror --sample 10 --seed 42
 
 # Recheck specific projects without fetching the root index.
-./target/release/snatchrs check --mirror mirror-shell --package requests --package packaging
+./target/release/snatchrs check ./mirror --package requests --package packaging
 
 # Emit the summary and detail-file paths as well as saving them in the mirror.
-./target/release/snatchrs check --mirror mirror-shell --package packaging --json > report.json
+./target/release/snatchrs check ./mirror --package packaging --json > report.json
 ```
 
-This command makes one root index request when sampling, then one metadata request
+This command requests the root index for `--all` and `--sample`, then fetches metadata
 per selected project. It never requests or downloads distribution files. A sample
 is without replacement; if the index has fewer packages than requested, all are
-selected. The report records the random seed and exact names. Seeds reproduce
+selected. Sample reports record the random seed and exact selected names. Seeds reproduce
 selection only for an unchanged index; use repeated `--package` arguments to
 recheck the exact names after PyPI changes.
 
@@ -127,7 +180,7 @@ with `--no-progress`, `--quiet`, or redirected stdout.
 The mirror layout is:
 
 ```text
-mirror-shell/
+./mirror/
   metadata/<normalized-name>.json       # enriched package/release/file metadata
   packages/<normalized-name>/           # empty initially
     <distribution-filename>             # expected future artifact location
@@ -137,7 +190,7 @@ mirror-shell/
 All filesystem paths stored in metadata, reports, JSONL details, and download
 outcomes are relative to the mirror root, such as
 `packages/packaging/packaging-25.0.tar.gz` or `reports/run-*/checked-packages.jsonl`.
-Resolve them against the directory passed to `--mirror`, rather than the working
+Resolve them against the positional mirror directory `DIR`, rather than the working
 directory or the JSON file's own directory. Reports use `mirror_root: "."`.
 Moving or copying the whole mirror preserves cached metadata, report links, and
 repeat-run file checks. Download URLs remain absolute HTTP/HTTPS URLs.
@@ -160,7 +213,7 @@ and yanked state.
 metadata follow `--index-url` by default. `--metadata-url` optionally overrides
 the Simple Index base for project metadata; it takes a Simple API base URL.
 
-On sampled runs, `check` and `mirror` reuse saved project metadata when the current
+On `--all` and sampled runs, `check` and `mirror` reuse saved project metadata when the current
 root listing's `_last-serial` matches the cached project's serial. Caches are bound
 to both the root-listing project URL and the requested metadata URL (before
 redirects). Missing, older-format, malformed, or invalid caches are fetched again;
@@ -172,7 +225,7 @@ deleted files, and wrong sizes are still queued for repair.
 Use `--refresh` to force fresh metadata for every selected project:
 
 ```bash
-./target/release/snatchrs mirror --mirror ./mirror-shell --sample 10000 --refresh
+./target/release/snatchrs mirror ./mirror --sample 10000 --refresh
 ```
 
 Both commands fetch project metadata with a bounded worker pool:
@@ -184,16 +237,16 @@ large samples do not accumulate all results in memory. Lower the metadata worker
 count if individual projects have very large metadata responses.
 
 ```bash
-./target/release/snatchrs mirror --mirror ./mirror-shell --sample 10000 --metadata-concurrency 8 --concurrency 16
+./target/release/snatchrs mirror ./mirror --sample 10000 --metadata-concurrency 8 --concurrency 16
 ```
 
 Detail records and plain package output follow completion order. The summary's
-`selected_packages` list still records the original selection order, and
-`metadata_concurrency` records the configured limit. Use
+`selected_packages` list records the original selection order except for `--all`,
+which omits that list. `metadata_concurrency` records the configured limit. Use
 `--metadata-concurrency 1` for sequential metadata requests.
 
-Explicit `--package` selection does not fetch the root listing and therefore
-always fetches metadata. Failed refreshes report an error and preserve the previous
+`--package` and `--packages-file` do not fetch the root listing and therefore
+always fetch metadata. Failed refreshes report an error and preserve the previous
 cache; they do not silently fall back to potentially stale metadata.
 
 A project's metadata endpoint returning HTTP 404 is recorded separately as
@@ -229,22 +282,22 @@ exit status; ordinary missing/size-mismatched files do not.
 
 ```bash
 cargo build --release --locked
-./target/release/snatchrs mirror --mirror ./mirror-shell --sample 100 --concurrency 8
-./target/release/snatchrs mirror --mirror ./mirror-shell --sample 100 --seed 42 -j 4
-./target/release/snatchrs mirror --mirror ./mirror-shell --package packaging --threads 2
+./target/release/snatchrs mirror ./mirror --sample 100 --concurrency 8
+./target/release/snatchrs mirror ./mirror --sample 100 --seed 42 -j 4
+./target/release/snatchrs mirror ./mirror --package packaging -j 2
 ```
 
-`mirror` defaults to **100 randomly sampled package names**. `--sample` controls
-the requested count without a package-count cap; for example, `--sample 10000`
-selects 10,000 names (or all names if the index is smaller). Every available version and distribution of those
-projects is included. `--package` selects exact names instead. Sampling can select
-projects whose metadata has disappeared; these are recorded as errors while the
-remaining selected packages are processed, without drawing replacement packages.
+`mirror` requires a directory and an explicit selection; it never picks a random
+sample unless `--sample N` is given. Samples have no package-count cap; for
+example, `--sample 10000` selects 10,000 names (or all names if the index is
+smaller). Every available version and distribution of each selected project is
+included. Projects whose metadata returns 404 are recorded as unavailable while
+the remaining selection is processed, without drawing replacement packages.
 
-`--concurrency` (`-j`, alias `--threads`) controls simultaneous downloads, from 1
-through 64; the default is 8. Metadata discovery is sequential, and overlaps with
-downloads: each checked package immediately feeds missing/wrong-sized files into
-a disk-backed pending queue. Workers start downloading those files while later
+`--concurrency` (`-j`) controls simultaneous downloads, from 1
+through 64; the default is 8. Metadata fetching uses four workers by default and
+overlaps with downloads: each checked package immediately feeds missing or
+wrong-sized files into a disk-backed pending queue. Workers start downloading those files while later
 packages are still being fetched and checked. The checker can keep adding jobs
 even when every download worker is busy; it does not wait for download slots.
 Pending jobs are spooled to a temporary JSON-lines file under the mirror root,
@@ -285,11 +338,13 @@ For noninteractive runs, concise progress is logged to stderr every five seconds
 
 Saved files include:
 
-- `check-report.json`: selected names, seed, inspection counters, `error_count`, and paths to detail files; written when discovery ends.
+- `check-report.json`: `selection`, seed, inspection counters, `error_count`, and paths to detail files; written when discovery ends. `selection` is `all`, `packages`, `packages_file`, or `sample`. `selected_packages` contains normalized names in selection order for the latter three modes and is absent for `all`; `packages_file` records the supplied input path only for that mode.
 - `mirror-progress.json`: periodically updated checking, worker, and transfer progress.
 - `mirror-report.json`: inspection summary, download counters, `downloads.outcomes_path`, and final size checks. The
-  `simple_index` object records `projects`, `files_linked`, and `files_skipped` for
-  pages generated during that run (the root index also retains earlier projects).
+  `simple_index` object records `projects`, `files_linked`, `files_skipped`, and
+  `projects_removed`. The first three describe pages generated during the run;
+  `projects_removed` counts obsolete pages pruned in the final pass of a `--all`
+  mirror run, including runs with per-project failures.
 - `reports/run-*/checked-packages.jsonl`: one checked package per line, including metadata and initial file states (`inspection.packages_path`).
 - `reports/run-*/package-errors.jsonl`: one metadata/queue error per line (`inspection.errors_path`).
 - `reports/run-*/unavailable-projects.jsonl`: one project metadata 404 per line, with name, requested metadata URL, `status: "not_found"`, and `http_status: 404` (`inspection.unavailable_path`).
@@ -300,8 +355,9 @@ all package metadata or completed download outcomes in memory. Final size checks
 read one checked package at a time. `--json` prints the compact summary, using the
 same format as the saved report. The previous inline `packages`, `errors`, and
 `downloads.outcomes` arrays have been replaced by the JSONL paths above; consumers
-should stream those files line by line. Selected names and queue deduplication
-fingerprints are still retained in memory. Metadata held by active workers and
+should stream those files line by line. Selected names are retained for explicit lists/samples, and `--all` retains root-index
+identities for authoritative pruning. Download deduplication keeps only the
+current package's paths and fingerprints. Metadata held by active workers and
 the bounded result buffer must also fit in memory.
 
 Each run has its own detail directory. Earlier report paths remain readable after
@@ -318,7 +374,7 @@ and uv; see [Serving the mirror](#serving-the-mirror).
 For a 10,000-package download run:
 
 ```bash
-./target/release/snatchrs mirror --mirror ./mirror-shell --sample 10000 --seed 42 --concurrency 8
+./target/release/snatchrs mirror ./mirror --sample 10000 --seed 42 --concurrency 8
 ```
 
 To verify a copied binary without Rust, the standalone smoke test uses Python's
@@ -332,14 +388,14 @@ python3 scripts/pipeline-smoke.py --binary ./target/release/snatchrs
 # Verify checking/queueing can finish while every download worker is blocked:
 python3 scripts/pipeline-smoke.py --binary ./target/release/snatchrs --check-ahead
 # Independently re-read and hash a completed mirror's artifacts:
-python3 scripts/verify-mirror.py ./mirror-shell
+python3 scripts/verify-mirror.py ./mirror
 ```
 
 For a long-running mirror, run the command inside your terminal multiplexer.
 The optional runner accepts a mirror root followed by any `mirror` options:
 
 ```bash
-SNATCHRS_BIN=./target/release/snatchrs bash scripts/run-mirror.sh ./mirror-shell --sample 10000 --concurrency 8
+SNATCHRS_BIN=./target/release/snatchrs bash scripts/run-mirror.sh ./mirror --sample 10000 --concurrency 8
 ```
 
 The runner uses `snatchrs` from `PATH` unless `SNATCHRS_BIN` is provided. It records
@@ -374,8 +430,8 @@ releasing its disk reservation. Previously published files remain intact. The
 TUI and `mirror-progress.json` identify workers waiting to retry and their delay.
 
 ```bash
-./target/release/snatchrs check --mirror ./mirror-shell --package packaging --attempts 5
-./target/release/snatchrs mirror --mirror ./mirror-shell --sample 100 --attempts 5
+./target/release/snatchrs check ./mirror --package packaging --attempts 5
+./target/release/snatchrs mirror ./mirror --sample 100 --attempts 5
 ```
 
 ## HTTP and HTTPS proxies
@@ -395,7 +451,7 @@ export HTTP_PROXY=http://proxy.example.org:3128
 export HTTPS_PROXY=http://proxy.example.org:3128
 export NO_PROXY=localhost,127.0.0.1
 
-./target/release/snatchrs mirror --mirror ./mirror-shell --sample 100 --concurrency 8
+./target/release/snatchrs mirror ./mirror --sample 100 --concurrency 8
 ```
 
 Replace the example proxy hostname with your proxy. An `http://` proxy URL in
@@ -478,7 +534,7 @@ To generate pages for an existing mirror, or update links after manually removin
 artifacts, run:
 
 ```bash
-./target/release/snatchrs simple --mirror /srv/pypi
+./target/release/snatchrs simple /srv/pypi
 ```
 
 This takes the mirror lock, reads one `metadata/*.json` file at a time, and prints

@@ -4,6 +4,7 @@ pub mod download;
 mod filename;
 mod http;
 pub mod mirror;
+pub mod selection;
 pub mod simple;
 
 use std::{

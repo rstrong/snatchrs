@@ -247,7 +247,6 @@ fn check_cli_attempt_budget_applies_to_metadata_and_is_exhausted() {
             "--metadata-url",
             &format!("{}/simple/", server.url),
             "--json",
-            "--mirror",
         ])
         .arg(root.path())
         .output()
@@ -408,7 +407,6 @@ fn project_404_is_not_retried_and_later_projects_are_still_checked() {
                 &format!("{}/simple/", server.url),
                 "--json",
                 "--quiet",
-                "--mirror",
             ])
             .arg(root.path())
             .output()

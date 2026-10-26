@@ -46,7 +46,7 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="snatchrs-smoke-", dir=args.temp_root) as directory:
             root = Path(directory) / "original"
-            common = ["--mirror", str(root), "--package", "remote-smoke", "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/", "--json"]
+            common = [str(root), "--package", "remote-smoke", "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/", "--json"]
 
             def run(command, *extra):
                 result = subprocess.run([str(args.binary.resolve()), command, *common, *extra], capture_output=True, text=True, timeout=30)
@@ -72,7 +72,7 @@ def main():
             moved = Path(directory) / "moved"
             root.rename(moved)
             root = moved
-            common[1] = str(root)
+            common[0] = str(root)
             # Verify the saved report before any command can replace it.
             verification = subprocess.run([
                 sys.executable, str(Path(__file__).with_name("verify-mirror.py")), str(root)
@@ -91,7 +91,7 @@ def main():
             # any PyPI requests: this local index contains one fixture project.
             result = subprocess.run([
                 str(args.binary.resolve()), "mirror", "--sample", "10000",
-                "--mirror", str(root), "--index-url", f"http://127.0.0.1:{server.server_port}/simple/",
+                str(root), "--index-url", f"http://127.0.0.1:{server.server_port}/simple/",
                 "--metadata-url", f"http://127.0.0.1:{server.server_port}/simple/", "--json"
             ], capture_output=True, text=True, timeout=30)
             if result.returncode:

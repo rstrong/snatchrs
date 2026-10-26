@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Write},
     path::PathBuf,
@@ -12,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use clap::Args;
+use clap::{ArgGroup, Args};
 use serde::Serialize;
 use snatchrs::{
     DEFAULT_INDEX_URL, IndexClient, IndexProgress, Package,
@@ -24,33 +25,51 @@ use snatchrs::{
 use url::Url;
 
 #[derive(Args)]
+#[command(group(ArgGroup::new("selection").required(true).multiple(false)
+    .args(["all", "packages", "packages_file", "sample"])))]
 pub struct CheckArgs {
-    /// Mirror root; creates metadata and empty package directories as needed.
-    #[arg(long, default_value = "mirror-shell")]
+    /// Mirror directory.
+    #[arg(value_name = "DIR")]
     mirror: PathBuf,
-    /// Random project count (check defaults to 10, mirror defaults to 100).
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-    sample: Option<u32>,
-    /// Repeatable random selection for an unchanged root index.
+    /// Select every project in the index.
     #[arg(long)]
-    seed: Option<u64>,
-    /// Inspect a specific package instead of sampling; repeat to select several.
-    #[arg(long = "package", conflicts_with_all = ["sample", "seed"])]
+    all: bool,
+    /// Select a project; repeat for more names.
+    #[arg(long = "package", value_name = "NAME")]
     packages: Vec<String>,
-    #[arg(long, default_value = DEFAULT_INDEX_URL)]
+    /// Read project names from a file.
+    #[arg(long, value_name = "PATH")]
+    packages_file: Option<PathBuf>,
+    /// Select N random projects.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    sample: Option<u32>,
+    /// Seed for repeatable sampling.
+    #[arg(long, requires = "sample", conflicts_with_all = ["all", "packages", "packages_file"])]
+    seed: Option<u64>,
+    /// Root Simple Index URL.
+    #[arg(long, value_name = "URL", default_value = DEFAULT_INDEX_URL, help_heading = "Advanced")]
     index_url: Url,
-    /// Override the per-project Simple Index base (defaults to --index-url).
-    #[arg(long)]
+    /// Override the project metadata base URL.
+    #[arg(long, value_name = "URL", help_heading = "Advanced")]
     metadata_url: Option<Url>,
-    /// Simultaneous project metadata requests (1–32), separate from downloads.
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=32))]
+    /// Metadata workers (1–32).
+    #[arg(long, value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=32), help_heading = "Advanced")]
     metadata_concurrency: u16,
-    /// Fetch fresh project metadata even when its cached serial is unchanged.
-    #[arg(long)]
+    /// Fetch fresh project metadata.
+    #[arg(long, help_heading = "Advanced")]
     refresh: bool,
-    /// Print the summary report as JSON (details are stored in JSONL files).
-    #[arg(long)]
+    /// Print the summary report as JSON.
+    #[arg(long, help_heading = "Advanced")]
     json: bool,
+}
+
+#[derive(Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SelectionMode {
+    All,
+    Packages,
+    PackagesFile,
+    Sample,
 }
 
 struct MetadataOptions {
@@ -130,7 +149,11 @@ struct CheckReport {
     mirror_root: PathBuf,
     metadata_concurrency: usize,
     seed: Option<u64>,
-    selected_packages: Vec<String>,
+    selection: SelectionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packages_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_packages: Option<Vec<String>>,
     summary: CheckSummary,
     packages_path: PathBuf,
     errors_path: PathBuf,
@@ -197,8 +220,8 @@ fn visit_packages(
 pub struct MirrorArgs {
     #[command(flatten)]
     selection: CheckArgs,
-    /// Simultaneous download workers (1–64).
-    #[arg(short = 'j', long, alias = "threads", default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
+    /// Download workers (1–64).
+    #[arg(short = 'j', long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
     concurrency: u16,
 }
 
@@ -242,33 +265,66 @@ fn run_inner(
         refresh: args.refresh,
         concurrency: usize::from(args.metadata_concurrency),
     };
-    let seed = args
-        .packages
-        .is_empty()
-        .then(|| args.seed.unwrap_or_else(rand::random));
-    let packages = if let Some(seed) = seed {
-        let index =
+    let seed = args.sample.map(|_| args.seed.unwrap_or_else(rand::random));
+    let selection = if args.all {
+        SelectionMode::All
+    } else if args.sample.is_some() {
+        SelectionMode::Sample
+    } else if args.packages_file.is_some() {
+        SelectionMode::PackagesFile
+    } else {
+        SelectionMode::Packages
+    };
+    let mut authoritative_names = None;
+    let packages = if args.all || args.sample.is_some() {
+        let mut index =
             client.fetch_with_progress(args.index_url.clone(), |event: IndexProgress<'_>| {
                 if let Some(dashboard) = dashboard.as_mut() {
                     dashboard.update(event);
                 }
             })?;
-        sample_packages(
-            &index,
-            args.sample
-                .unwrap_or(if download.is_some() { 100 } else { 10 }) as usize,
-            seed,
-        )
+        // Deduplicate in place; --all moves the index's existing package vector
+        // into the worker pool rather than cloning it or recording every name.
+        let mut names = HashSet::new();
+        index
+            .packages
+            .retain(|package| names.insert(package.normalized_name.clone()));
+        if args.all {
+            if download.is_some() {
+                authoritative_names = Some(names);
+            }
+            index.packages
+        } else {
+            sample_packages(
+                &index,
+                args.sample.context("Missing sample size")? as usize,
+                seed.context("Missing sample seed")?,
+            )
+        }
     } else {
+        let names = if let Some(path) = &args.packages_file {
+            let names = snatchrs::selection::names_from_reader(BufReader::new(
+                File::open(path)
+                    .with_context(|| format!("Cannot open packages file {}", path.display()))?,
+            ))
+            .with_context(|| format!("Cannot read packages file {}", path.display()))?;
+            ensure!(
+                !names.is_empty(),
+                "No project names found in {}",
+                path.display()
+            );
+            names
+        } else {
+            snatchrs::selection::normalize_names(args.packages)?
+        };
         let base = snatchrs::normalize_index_url(args.index_url)?;
-        args.packages
+        names
             .into_iter()
             .map(|name| {
-                let normalized_name = snatchrs::normalize_name(&name)?;
                 Ok(Package {
-                    index_url: base.join(&format!("{normalized_name}/"))?,
+                    index_url: base.join(&format!("{name}/"))?,
+                    normalized_name: name.clone(),
                     name,
-                    normalized_name,
                     last_serial: None,
                 })
             })
@@ -293,10 +349,14 @@ fn run_inner(
         mirror_root: PathBuf::from("."),
         metadata_concurrency: metadata_options.concurrency,
         seed,
-        selected_packages: packages
-            .iter()
-            .map(|package| package.normalized_name.clone())
-            .collect(),
+        selection,
+        packages_file: args.packages_file,
+        selected_packages: (selection != SelectionMode::All).then(|| {
+            packages
+                .iter()
+                .map(|package| package.normalized_name.clone())
+                .collect()
+        }),
         summary: CheckSummary::default(),
         packages_path,
         errors_path,
@@ -312,7 +372,7 @@ fn run_inner(
             &layout,
             &client,
             packages,
-            (report, journal),
+            (report, journal, authoritative_names),
             metadata_options,
             options,
             OutputOptions {
@@ -463,7 +523,7 @@ fn run_pipeline(
     layout: &MirrorLayout,
     client: &IndexClient,
     packages: Vec<Package>,
-    inspection: (CheckReport, InspectionJournal),
+    inspection: (CheckReport, InspectionJournal, Option<HashSet<String>>),
     metadata_options: MetadataOptions,
     options: snatchrs::download::DownloadOptions,
     output: OutputOptions,
@@ -473,8 +533,8 @@ fn run_pipeline(
         no_progress,
         json,
     } = output;
+    let (inspection, journal, authoritative_names) = inspection;
     let outcomes_path = inspection
-        .0
         .packages_path
         .parent()
         .context("Missing run directory")?
@@ -497,7 +557,7 @@ fn run_pipeline(
                 client,
                 metadata_options,
                 packages,
-                inspection,
+                (inspection, journal),
             )
         },
         |progress| {
@@ -544,6 +604,17 @@ fn run_pipeline(
         check_package(&layout.root, package.metadata, &mut final_check);
         Ok(())
     })?;
+    // Reaching the final pass means the root listing was fetched completely.
+    // Per-project failures do not weaken its authority about deleted projects.
+    if let Some(names) = authoritative_names {
+        for name in snatchrs::simple::project_names(&layout.root)? {
+            if !names.contains(&name) {
+                layout.invalidate_metadata(&name)?;
+                snatchrs::simple::remove_project_page(&layout.root, &name)?;
+                simple_index.projects_removed += 1;
+            }
+        }
+    }
     snatchrs::simple::write_root_index(&layout.root)?;
     let report = MirrorReport {
         final_check,

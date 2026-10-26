@@ -20,12 +20,14 @@ pub struct SimpleSummary {
     pub projects: usize,
     pub files_linked: usize,
     pub files_skipped: usize,
+    pub projects_removed: usize,
 }
 impl SimpleSummary {
     pub fn add(&mut self, page: Self) {
         self.projects += page.projects;
         self.files_linked += page.files_linked;
         self.files_skipped += page.files_skipped;
+        self.projects_removed += page.projects_removed;
     }
 }
 
@@ -172,9 +174,11 @@ pub fn write_project_page(root: &Path, metadata: &PackageMetadata) -> Result<Sim
 
 /// Index all existing project pages, including projects from earlier samples.
 /// Only project directory names are retained for sorting; metadata is not read.
-pub fn write_root_index(root: &Path) -> Result<usize> {
+pub fn project_names(root: &Path) -> Result<Vec<String>> {
     let simple = resolve_path(root, Path::new("simple"))?;
-    create_directory(&simple)?;
+    if !real_directory_exists(&simple)? {
+        return Ok(Vec::new());
+    }
     let mut projects = Vec::new();
     for entry in fs::read_dir(&simple)? {
         let entry = entry?;
@@ -208,6 +212,14 @@ pub fn write_root_index(root: &Path) -> Result<usize> {
         }
     }
     projects.sort();
+    Ok(projects)
+}
+
+/// Atomically rebuild the root page from existing project pages.
+pub fn write_root_index(root: &Path) -> Result<usize> {
+    let simple = resolve_path(root, Path::new("simple"))?;
+    create_directory(&simple)?;
+    let projects = project_names(root)?;
     atomic_html(&simple.join("index.html"), |writer| {
         header(writer, "Package index")?;
         for name in &projects {
@@ -353,7 +365,8 @@ mod tests {
             SimpleSummary {
                 projects: 1,
                 files_linked: 2,
-                files_skipped: 2
+                files_skipped: 2,
+                projects_removed: 0,
             }
         );
         let html = fs::read_to_string(root.path().join("simple/pkg/index.html")).unwrap();
@@ -465,7 +478,8 @@ mod tests {
             SimpleSummary {
                 projects: 1,
                 files_linked: 1,
-                files_skipped: 0
+                files_skipped: 0,
+                projects_removed: 0,
             }
         );
         fs::remove_file(root.path().join("packages/pkg/pkg.whl")).unwrap();
@@ -474,7 +488,8 @@ mod tests {
             SimpleSummary {
                 projects: 1,
                 files_linked: 0,
-                files_skipped: 1
+                files_skipped: 1,
+                projects_removed: 0,
             }
         );
         assert!(

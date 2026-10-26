@@ -287,7 +287,6 @@ fn cli_downloads_then_skips_existing_file_on_repeat() {
                 "--concurrency",
                 "2",
                 "--json",
-                "--mirror",
             ])
             .arg(directory.path())
             .output()
@@ -380,7 +379,6 @@ fn mirror_respects_samples_above_one_hundred_and_smaller_indexes() {
                     "--json",
                     "--index-url",
                     &format!("{base}/simple/"),
-                    "--mirror",
                 ])
                 .arg(directory.path())
                 .output()
@@ -528,7 +526,6 @@ fn downloads_and_progress_start_before_later_metadata_finishes() {
             "--concurrency",
             "2",
             "--json",
-            "--mirror",
         ])
         .arg(directory.path())
         .output()

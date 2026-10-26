@@ -97,7 +97,7 @@ impl Server {
     }
     fn run(&self, root: &Path, mode: &str) -> Output {
         let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
-            .args([mode, "--mirror"])
+            .args([mode])
             .arg(root)
             .args([
                 "--package",
@@ -146,7 +146,7 @@ fn mirrored_links_resolve_locally_and_match_their_hashes_then_regenerate_and_rem
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         report["simple_index"],
-        serde_json::json!({"projects":1,"files_linked":2,"files_skipped":0})
+        serde_json::json!({"projects":1,"files_linked":2,"files_skipped":0,"projects_removed":0})
     );
     let root_page = fs::read_to_string(root.path().join("simple/index.html")).unwrap();
     let project_page =
@@ -188,7 +188,7 @@ fn mirrored_links_resolve_locally_and_match_their_hashes_then_regenerate_and_rem
     .unwrap();
     let before = server.requests.load(Ordering::Acquire);
     let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
-        .args(["simple", "--mirror"])
+        .args(["simple"])
         .arg(root.path())
         .output()
         .unwrap();
@@ -234,7 +234,7 @@ fn simple_takes_the_mirror_lock_and_can_generate_an_empty_index() {
     let layout = MirrorLayout::create(root.path()).unwrap();
     let lock = layout.lock().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
-        .args(["simple", "--mirror"])
+        .args(["simple"])
         .arg(root.path())
         .output()
         .unwrap();
@@ -243,7 +243,7 @@ fn simple_takes_the_mirror_lock_and_can_generate_an_empty_index() {
     assert!(!root.path().join("simple").exists());
     drop(lock);
     let output = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
-        .args(["simple", "--mirror"])
+        .args(["simple"])
         .arg(root.path())
         .output()
         .unwrap();

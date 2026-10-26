@@ -10,7 +10,7 @@ shift
 snatchrs_bin="${SNATCHRS_BIN:-snatchrs}"
 mkdir -p "$snatchrs_root" || exit 1
 printf 'running\n' > "$snatchrs_root/run.status" || exit 1
-"$snatchrs_bin" mirror --mirror "$snatchrs_root" "$@"
+"$snatchrs_bin" mirror "$snatchrs_root" "$@"
 snatchrs_exit=$?
 printf 'exit=%s\n' "$snatchrs_exit" > "$snatchrs_root/run.status"
 printf '\nsnatchrs exited with status %s; report: %s/mirror-report.json\n' "$snatchrs_exit" "$snatchrs_root"

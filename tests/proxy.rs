@@ -176,7 +176,6 @@ fn mirror(root: &Path, base: &str, metadata: &str) -> Command {
             base,
             "--metadata-url",
             metadata,
-            "--mirror",
         ])
         .arg(root);
     command

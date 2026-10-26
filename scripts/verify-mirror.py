@@ -53,7 +53,9 @@ def main():
                     except (OSError, ValueError) as error:
                         failures.append({"path": file["local_path"], "error": str(error)})
     result = {
-        "selected_names": len(report["inspection"]["selected_packages"]),
+        "selected_names": (len(report["inspection"]["selected_packages"])
+                           if report["inspection"].get("selected_packages") is not None
+                           else report["downloads"]["progress"]["discovery"]["total_packages"]),
         "metadata_packages": metadata_packages,
         "unavailable_projects": report["inspection"].get("unavailable_count", 0),
         "metadata_errors": [json.loads(line) for line in mirror_path(report["inspection"]["errors_path"]).read_text().splitlines()],

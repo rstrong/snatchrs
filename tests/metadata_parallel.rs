@@ -135,7 +135,6 @@ fn metadata_limit_is_respected_and_fast_results_pass_a_blocked_first_project() {
                 &format!("{base}/simple/"),
                 "--json",
                 "--quiet",
-                "--mirror",
             ])
             .arg(root.path())
             .env("NO_PROXY", "*")

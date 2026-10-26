@@ -125,7 +125,7 @@ impl Server {
 
     fn command(&self, root: &Path, mode: &str, extra: &[&str]) -> std::process::Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_snatchrs"));
-        command.args([mode, "--mirror"]).arg(root);
+        command.args([mode]).arg(root);
         if !extra.contains(&"--package") {
             command.args(["--sample", "1"]);
         }

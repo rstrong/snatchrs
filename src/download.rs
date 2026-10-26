@@ -322,6 +322,7 @@ pub struct DownloadQueue {
     jobs: Arc<DiskQueue>,
     events: mpsc::SyncSender<Event>,
     seen: BTreeMap<PathBuf, [u8; 32]>,
+    seen_package: Option<String>,
     total_bytes: u64,
 }
 impl DownloadQueue {
@@ -340,6 +341,12 @@ impl DownloadQueue {
                 .strip_prefix(&self.root)
                 .context("Download path escapes mirror root")?
                 .to_path_buf();
+        }
+        // The selection is unique and the producer queues one package at a
+        // time. Keep conflict detection bounded by the current package.
+        if self.seen_package.as_deref() != Some(&task.package) {
+            self.seen.clear();
+            self.seen_package = Some(task.package.clone());
         }
         // Retain only path + fingerprint for deduplication, not another full
         // in-memory copy of every pending task already written to the spool.
@@ -506,6 +513,7 @@ fn stream_with_workers<T: Send>(
         jobs: jobs.clone(),
         events: events.clone(),
         seen: BTreeMap::new(),
+        seen_package: None,
         total_bytes: 0,
     };
     let start = Instant::now();
@@ -772,4 +780,42 @@ fn download_one(
         progress(unreported);
     }
     result
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::*;
+
+    #[test]
+    fn dedupe_memory_is_scoped_to_one_package_and_conflicts_still_fail() {
+        let root = tempfile::tempdir().unwrap();
+        let (events, _receiver) = mpsc::sync_channel(4);
+        let mut queue = DownloadQueue {
+            root: root.path().canonicalize().unwrap(),
+            jobs: Arc::new(DiskQueue::new(root.path()).unwrap()),
+            events,
+            seen: BTreeMap::new(),
+            seen_package: None,
+            total_bytes: 0,
+        };
+        for name in ["first", "second", "third"] {
+            fs::create_dir_all(root.path().join("packages").join(name)).unwrap();
+            let item = DownloadTask {
+                package: name.into(),
+                filename: "file.whl".into(),
+                download_url: "http://127.0.0.1:1/file".parse().unwrap(),
+                local_path: Path::new("packages").join(name).join("file.whl"),
+                size: 1,
+                sha256: None,
+            };
+            queue.enqueue(item.clone()).unwrap();
+            queue.enqueue(item.clone()).unwrap();
+            let mut conflicting = item;
+            conflicting.size = 2;
+            assert!(queue.enqueue(conflicting).is_err());
+            assert_eq!(queue.seen.len(), 1);
+            assert_eq!(queue.seen_package.as_deref(), Some(name));
+        }
+        assert_eq!(queue.total_bytes, 3);
+    }
 }

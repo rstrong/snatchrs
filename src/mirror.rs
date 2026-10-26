@@ -267,7 +267,8 @@ impl MirrorLayout {
         Some(metadata)
     }
 
-    fn invalidate_metadata(&self, name: &str) -> Result<()> {
+    /// Invalidate only enriched metadata, preserving downloaded artifacts.
+    pub fn invalidate_metadata(&self, name: &str) -> Result<()> {
         let name = normalize_name(name)?;
         let path = self.root.join("metadata").join(format!("{name}.json"));
         match fs::remove_file(path) {
