@@ -459,3 +459,71 @@ fn worker_states_serialize_as_progress_file_strings() {
         assert_eq!(state.to_string(), text);
     }
 }
+
+fn fetch_json_with_client(
+    server: &Server,
+    client: &IndexClient,
+    project: bool,
+) -> anyhow::Result<()> {
+    if project {
+        let root = tempdir().unwrap();
+        let layout = MirrorLayout::create(root.path())?;
+        let metadata = client.fetch_metadata(
+            Package {
+                name: "retry-fixture".into(),
+                normalized_name: "retry-fixture".into(),
+                index_url: format!("{}/simple/retry-fixture/", server.url).parse()?,
+                last_serial: None,
+            },
+            format!("{}/simple/", server.url).parse()?,
+            &layout,
+        )?;
+        assert_eq!(metadata.package.normalized_name, "retry-fixture");
+    } else {
+        let index = client.fetch(format!("{}/simple/", server.url).parse()?)?;
+        assert_eq!(index.packages[0].normalized_name, "retry-fixture");
+    }
+    Ok(())
+}
+
+const ROOT_INDEX: &str = r#"{"meta":{"api-version":"1.0"},"projects":[{"name":"retry-fixture"}]}"#;
+
+#[test]
+fn index_and_metadata_steady_bodies_outlast_the_read_stall_timeout() {
+    let stall = Duration::from_millis(400);
+    for project in [false, true] {
+        let json = if project { METADATA } else { ROOT_INDEX };
+        let body = format!("{}{json}", " ".repeat(16 * 1024));
+        let mut reply = Reply::new(200, body.as_bytes());
+        reply.chunk_delay = Duration::from_millis(100);
+        let server = Server::start(vec![reply]);
+        let client = IndexClient::with_options(1, stall).unwrap();
+        let start = Instant::now();
+        fetch_json_with_client(&server, &client, project).unwrap();
+        assert!(start.elapsed() > stall * 3);
+        assert_eq!(server.count(), 1);
+    }
+}
+
+#[test]
+fn index_and_metadata_true_body_stalls_exhaust_the_retry_budget() {
+    let stall = Duration::from_millis(250);
+    for project in [false, true] {
+        let json = if project { METADATA } else { ROOT_INDEX };
+        let body = format!("{}{json}", " ".repeat(2 * 1024));
+        let mut reply = Reply::new(200, body.as_bytes());
+        // The first chunk arrives immediately; subsequent chunks miss the stall
+        // deadline, so each attempt fails while reading the response body.
+        reply.chunk_delay = Duration::from_millis(750);
+        let server = Server::start(vec![reply]);
+        let client = IndexClient::with_options(2, stall).unwrap();
+        let error = fetch_json_with_client(&server, &client, project).unwrap_err();
+        let message = format!("{error:#}").to_lowercase();
+        assert!(
+            message.contains("timed out") || message.contains("timeout"),
+            "{message}"
+        );
+        assert!(message.contains("2 attempt(s)"), "{message}");
+        assert_eq!(server.count(), 2);
+    }
+}

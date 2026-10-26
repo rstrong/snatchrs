@@ -95,7 +95,7 @@ impl Default for DownloadOptions {
             concurrency: 8,
             attempts: 3,
             min_free: 1024 * 1024 * 1024,
-            read_timeout: Duration::from_secs(900),
+            read_timeout: crate::http::DOWNLOAD_READ_TIMEOUT,
         }
     }
 }

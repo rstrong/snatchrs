@@ -130,6 +130,7 @@ impl<'a> IntoIterator for &'a PackageIndex {
 /// Reuse one HTTP client across future discovery and metadata operations.
 pub struct IndexClient {
     client: Client,
+    read_runtime: tokio::runtime::Runtime,
     attempts: u32,
     interrupt: interrupt::StopToken,
 }
@@ -140,14 +141,27 @@ impl IndexClient {
     }
 
     pub fn with_attempts(attempts: u32) -> Result<Self> {
+        Self::with_options(attempts, http::METADATA_READ_TIMEOUT)
+    }
+
+    /// Override the read-stall interval for embedded callers and local tests.
+    #[doc(hidden)]
+    pub fn with_options(attempts: u32, stall: Duration) -> Result<Self> {
         ensure!(
             (1..=10).contains(&attempts),
             "Request attempts must be between 1 and 10"
         );
         Ok(Self {
-            client: http::client_builder()
-                .timeout(Duration::from_secs(180))
-                .gzip(true)
+            client: reqwest::blocking::ClientBuilder::from(
+                http::transport_builder().read_timeout(stall).gzip(true),
+            )
+            // Disable the blocking wrapper's independent 30 s timeout too.
+            // Only connect and read-stall deadlines should limit a request.
+            .timeout(None)
+            .build()?,
+            read_runtime: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
                 .build()?,
             attempts,
             interrupt: interrupt::StopToken::default(),
@@ -169,6 +183,9 @@ impl IndexClient {
         mut progress: impl FnMut(IndexProgress<'_>),
     ) -> Result<PackageIndex> {
         let index_url = normalize_index_url(index_url)?;
+        // reqwest polls blocking response bodies on this caller's thread;
+        // enter a running timer driver for the transport's read timeout.
+        let _runtime = self.read_runtime.enter();
         http::get(
             &self.client,
             &index_url,

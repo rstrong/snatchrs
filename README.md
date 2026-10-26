@@ -310,8 +310,10 @@ sizes are skipped. Missing and wrong-sized files are deduplicated by local path
 and downloaded by a bounded worker pool. Conflicting metadata for one path fails.
 
 New downloads are streamed to unique temporary files on the target filesystem.
-Downloads use a 900-second read-stall timeout, reset whenever response data
-arrives, with no total transfer deadline. The connection timeout remains 15 seconds.
+Index and metadata requests use a 60-second read-stall timeout; downloads use
+900 seconds. These timeouts reset whenever response data arrives, with no total
+transfer deadline. The connection timeout is 15 seconds. API/CDN metadata should
+respond promptly, while artifact mirrors can be slower.
 Automatic HTTP decompression is disabled. Expected byte size and SHA256 (when
 provided by PyPI) must match before a file is atomically published. A failed
 replacement leaves the previous file intact. Artifacts are stored as bytes and

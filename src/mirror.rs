@@ -176,6 +176,7 @@ impl IndexClient {
     ) -> Result<PackageMetadata> {
         let base = normalize_index_url(metadata_base)?;
         let url = base.join(&format!("{}/", normalize_name(&package.name)?))?;
+        let _runtime = self.read_runtime.enter();
         crate::http::get(
             &self.client,
             &url,

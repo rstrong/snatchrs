@@ -9,15 +9,15 @@ use anyhow::{Error, Result};
 use rand::Rng;
 use reqwest::{
     StatusCode,
-    blocking::{Client, ClientBuilder, Response},
+    blocking::{Client, Response},
     header::{HeaderValue, RETRY_AFTER},
 };
 
 pub(crate) const DEFAULT_ATTEMPTS: u32 = 3;
 
-pub(crate) fn client_builder() -> ClientBuilder {
-    transport_builder().into()
-}
+// API/CDN metadata should respond promptly; artifact mirrors may be slower.
+pub(crate) const METADATA_READ_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(900);
 
 pub(crate) fn transport_builder() -> reqwest::ClientBuilder {
     // Keep reqwest's automatic environment-proxy discovery enabled. Installing
@@ -351,29 +351,23 @@ mod tests {
                         break;
                     }
                 }
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
-                    .unwrap();
+                let body = br#"{"meta":{"api-version":"1.0"},"projects":[]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body[..1]).unwrap();
                 if attempt == 0 {
                     thread::sleep(Duration::from_millis(500));
                 }
-                let _ = stream.write_all(b"[]");
+                let _ = stream.write_all(&body[1..]);
             }
         });
-        let client = client_builder()
-            .timeout(Duration::from_millis(250))
-            .build()
-            .unwrap();
-        let result: serde_json::Value = get(
-            &client,
-            &url,
-            "application/json",
-            2,
-            &crate::interrupt::StopToken::default(),
-            |response| serde_json::from_reader(response).map_err(json_error),
-        )
-        .unwrap();
+        let client = crate::IndexClient::with_options(2, Duration::from_millis(250)).unwrap();
+        let result = client.fetch(url).unwrap();
         server.join().unwrap();
-        assert_eq!(result, serde_json::json!([]));
+        assert!(result.packages.is_empty());
     }
 }
