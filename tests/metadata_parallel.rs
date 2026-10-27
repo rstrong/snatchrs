@@ -41,6 +41,8 @@ fn metadata_limit_is_respected_and_fast_results_pass_a_blocked_first_project() {
                 while !server_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // Accepted sockets inherit O_NONBLOCK from the listener on macOS/BSD.
+                            stream.set_nonblocking(false).unwrap();
                             let slow_started = &slow_started;
                             let release_slow = &release_slow;
                             let observed = &server_observed;

@@ -339,6 +339,8 @@ fn mirror_respects_samples_above_one_hundred_and_smaller_indexes() {
             while !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets inherit O_NONBLOCK from the listener on macOS/BSD.
+                        stream.set_nonblocking(false).unwrap();
                         let base = &server_base;
                         let index = &index;
                         scope.spawn(move || {
@@ -475,6 +477,8 @@ fn downloads_and_progress_start_before_later_metadata_finishes() {
             while !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets inherit O_NONBLOCK from the listener on macOS/BSD.
+                        stream.set_nonblocking(false).unwrap();
                         let early = &early;
                         let target = &target;
                         let progress_path = &progress_path;

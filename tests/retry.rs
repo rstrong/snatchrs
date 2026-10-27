@@ -70,6 +70,8 @@ impl Server {
                 while !stopping.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // Accepted sockets inherit O_NONBLOCK from the listener on macOS/BSD.
+                            stream.set_nonblocking(false).unwrap();
                             let replies = &replies;
                             let records = &records;
                             scope.spawn(move || {
