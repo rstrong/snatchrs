@@ -32,7 +32,7 @@ pub fn names_from_reader(reader: impl BufRead) -> Result<Vec<String>> {
         let line = line.with_context(|| format!("Cannot read line {number}"))?;
         let comment_only = line.trim_start().starts_with('#');
         if line.ends_with('\\') && !comment_only {
-            logical.push_str(line.trim_matches('\\'));
+            logical.push_str(&line[..line.len() - 1]);
             continue;
         }
         // Like pip, a comment-only physical line ends a pending logical line,

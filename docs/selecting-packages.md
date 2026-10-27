@@ -48,14 +48,14 @@ project are selected from the configured index.
 
 This is not a full requirements parser. Invalid names and pip options such as
 `-r` and `-e` fail with their line number. An empty or comment-only file is an
-error. Hash-pinned lockfiles from uv (including
-`uv export --format requirements-txt`), pip-tools, and Poetry work. Backslash
-continuations are joined before comments are stripped. Lockfile hashes and per-requirement options are ignored: snatchrs
-still mirrors every version and checks downloads against the index's own hashes.
-Only hash options are allowed on standalone option lines; `-r`, `-e`,
-`--index-url`, and other pip option lines remain errors. A comment-only physical
-line ends a continuation, as in pip. Errors identify the first physical line of
-the logical requirement.
+error.
+
+Hash-pinned lockfiles work, including output from `uv pip compile
+--generate-hashes`, `uv export`, pip-tools and Poetry. Lines ending in `\` are
+joined as pip joins them, and `--hash` options are ignored: snatchrs mirrors every
+version and checks downloads against the index's own hashes. Other pip options,
+such as `-r`, `-e` and `--index-url`, are still errors. An error in a continued
+line reports the line number where that requirement starts.
 
 ## Include dependencies
 
