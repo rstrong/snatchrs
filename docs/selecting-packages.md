@@ -40,15 +40,22 @@ Foo[bar]==1; python_version<"3.9"
 name @ https://example.org/name.whl
 ```
 
-Blank lines and whole-line or trailing `#` comments are ignored. Extras, pins,
-constraints, markers, and direct URLs after the leading name are ignored too.
+Blank lines and comments are ignored. `#` begins a comment only at the start of
+a line or after whitespace; URL fragments such as `#sha256=...` stay intact.
+Extras, pins, constraints, markers, and direct URLs after the name are ignored too.
 The direct URL does not become a download source. All versions of each named
 project are selected from the configured index.
 
 This is not a full requirements parser. Invalid names and pip options such as
 `-r` and `-e` fail with their line number. An empty or comment-only file is an
-error. Hash-pinned multiline files generated with `--generate-hashes` are not
-supported; omit that option when generating the file.
+error. Hash-pinned lockfiles from uv (including
+`uv export --format requirements-txt`), pip-tools, and Poetry work. Backslash
+continuations are joined before comments are stripped. Lockfile hashes and per-requirement options are ignored: snatchrs
+still mirrors every version and checks downloads against the index's own hashes.
+Only hash options are allowed on standalone option lines; `-r`, `-e`,
+`--index-url`, and other pip option lines remain errors. A comment-only physical
+line ends a continuation, as in pip. Errors identify the first physical line of
+the logical requirement.
 
 ## Include dependencies
 

@@ -74,7 +74,7 @@ Things to know about the package list:
 
 - `pip freeze > requirements.txt` in a working environment also gives you a list.
 - Version pins, extras and markers are ignored. Every version is mirrored.
-- Hash-pinned lockfiles aren't supported yet. Compile without `--generate-hashes`.
+- Hash-pinned lockfiles work. The hashes are ignored.
 
 Sizes add up quickly. `requests` and `flask` with their dependencies came to 12
 projects, 4,736 files and about 790 MiB.
