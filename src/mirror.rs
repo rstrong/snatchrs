@@ -442,6 +442,7 @@ pub struct CheckSummary {
     pub releases: usize,
     pub files: usize,
     pub expected_bytes: u64,
+    pub download_bytes: u64,
     pub missing: usize,
     pub size_mismatch: usize,
     pub matching_size: usize,
@@ -463,6 +464,9 @@ pub fn check_package(
             let state = inspect_file(root, file);
             summary.files += 1;
             summary.expected_bytes += file.size;
+            if state.needs_download() {
+                summary.download_bytes += file.size;
+            }
             match &state {
                 FileState::Missing => summary.missing += 1,
                 FileState::SizeMismatch { .. } => summary.size_mismatch += 1,

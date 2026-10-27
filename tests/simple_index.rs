@@ -591,3 +591,63 @@ fn report_retention_flags_counts_and_current_references_work_across_commands() {
     assert!(String::from_utf8_lossy(&plain.stdout).contains("old report directories pruned"));
     assert!(String::from_utf8_lossy(&plain.stderr).contains("Pruned"));
 }
+
+#[test]
+fn check_reports_full_download_sizes_only_for_missing_and_wrong_sized_files() {
+    let server = Server::start();
+    let root = tempdir().unwrap();
+    let selected = (BODY.len() * 2) as u64;
+    let empty: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "check").stdout).unwrap();
+    assert_eq!(empty["summary"]["expected_bytes"], selected);
+    assert_eq!(empty["summary"]["download_bytes"], selected);
+    let first = root.path().join("packages/example-pkg").join(FILENAMES[0]);
+    fs::write(&first, BODY).unwrap();
+    let matching: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "check").stdout).unwrap();
+    assert_eq!(matching["summary"]["expected_bytes"], selected);
+    assert_eq!(matching["summary"]["download_bytes"], BODY.len());
+    assert_eq!(matching["summary"]["matching_size"], 1);
+    fs::write(&first, b"x").unwrap();
+    let wrong: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "check").stdout).unwrap();
+    assert_eq!(wrong["summary"]["download_bytes"], selected);
+    assert_eq!(wrong["summary"]["size_mismatch"], 1);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("check-report.json")).unwrap()).unwrap();
+    assert_eq!(saved["summary"]["download_bytes"], selected);
+    let plain = Command::new(env!("CARGO_BIN_EXE_snatchrs"))
+        .arg("check")
+        .arg(root.path())
+        .args([
+            "--package",
+            "Example_Pkg",
+            "--metadata-url",
+            &format!("{}/simple/", server.base),
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+        format!(
+            "2 files ({selected} bytes of {selected} bytes selected) need downloading; no downloads performed"
+        )
+    );
+    let mirrored: serde_json::Value =
+        serde_json::from_slice(&server.run(root.path(), "mirror").stdout).unwrap();
+    assert_eq!(
+        mirrored["inspection"]["summary"]["download_bytes"],
+        selected
+    );
+    assert_eq!(mirrored["final_check"]["download_bytes"], 0);
+    assert_eq!(mirrored["final_check"]["expected_bytes"], selected);
+}

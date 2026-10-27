@@ -83,11 +83,13 @@ details are shared by later runs; run journals do not copy them. See
 selection. A queue-wide error appears once with name `<queue>` and does not
 inflate the package-error count.
 
-`summary` contains `packages`, `releases`, `files`, `expected_bytes`, `missing`,
+`summary` contains `packages`, `releases`, `files`, `expected_bytes`,
+`download_bytes`, `missing`,
 `size_mismatch`, `matching_size`, `blocked`, and `stale_temp_files_removed`.
 `expected_bytes` totals all selected files, including existing files; it is not
-the remaining download size. `blocked` here includes nonregular files and
-inspection errors. Plain `check` prints counts; use `--json` for expected bytes.
+the remaining download size. `download_bytes` is the bytes of missing and
+wrong-sized files, which is what `mirror` would download. `blocked` here includes
+nonregular files and inspection errors. Plain `check` prints both sizes.
 
 ## Inspection journals
 

@@ -222,7 +222,7 @@ enum Event {
     },
 }
 
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     for (threshold, unit) in [
         (1u64 << 60, "EiB"),
         (1u64 << 50, "PiB"),

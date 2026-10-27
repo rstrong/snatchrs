@@ -557,8 +557,10 @@ fn run_inner(
         )?;
         writeln!(
             stdout,
-            "{} files need downloading; no downloads performed{}",
+            "{} files ({} of {} selected) need downloading; no downloads performed{}",
             report.summary.missing + report.summary.size_mismatch,
+            snatchrs::download::format_size(report.summary.download_bytes),
+            snatchrs::download::format_size(report.summary.expected_bytes),
             snatchrs::cleanup::retention_summary(report.reports_pruned)
         )?;
     }

@@ -63,13 +63,12 @@ project, resolve it with uv first:
 ```sh
 printf 'requests\n' > requirements.in
 uv pip compile requirements.in -o requirements.txt
-snatchrs check ./mirror --packages-file requirements.txt --json > check.json
+snatchrs check ./mirror --packages-file requirements.txt
 snatchrs mirror ./mirror --packages-file requirements.txt
 ```
 
-`check` looks up the projects without downloading anything.
-`summary.expected_bytes` in `check.json` is the total size of the selection,
-including files you already have.
+`check` looks up the projects without downloading anything. Its last line
+shows how many files, and how many bytes, `mirror` would download.
 
 Things to know about the package list:
 
