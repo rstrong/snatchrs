@@ -16,6 +16,38 @@ The mirror serves the HTML Simple API only, not the JSON one.
 
 ## Install
 
+Download your platform's archive and `SHA256SUMS` from the
+[latest release](https://github.com/rstrong/snatchrs/releases/latest). Then check
+the archive and install the binary. On Linux x86_64:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf snatchrs-*-x86_64-unknown-linux-musl.tar.gz
+sudo install snatchrs-*/snatchrs /usr/local/bin/
+```
+
+| Platform | Archive suffix |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-musl` |
+| Linux ARM64 | `aarch64-unknown-linux-musl` |
+| macOS, Apple Silicon | `aarch64-apple-darwin` |
+| macOS, Intel | `x86_64-apple-darwin` |
+
+The Linux binaries are static, so they run on any distribution.
+
+On macOS, check the archive with `shasum -a 256 -c --ignore-missing SHA256SUMS`.
+The binaries aren't notarized. If you downloaded with a browser, clear the
+quarantine flag before running it: `xattr -d com.apple.quarantine snatchrs`.
+
+To confirm that an archive was built by this repository's release workflow, pass
+its file name to the GitHub CLI:
+
+```sh
+gh attestation verify snatchrs-v0.1.0-x86_64-unknown-linux-musl.tar.gz --repo rstrong/snatchrs
+```
+
+### Build from source
+
 You need Git and Rust 1.89 or newer.
 
 ```sh
@@ -25,7 +57,6 @@ export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 This puts `snatchrs` in `~/.cargo/bin`.
-<!-- TODO(release): add prebuilt binary download once the release workflow exists -->
 
 ## Quick start
 

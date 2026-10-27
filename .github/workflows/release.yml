@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check-version:
+    name: Check release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Match the tag to Cargo.toml
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "snatchrs") | .version')"
+          if [[ "$TAG" == "v$version" ]]; then
+            prerelease=false
+          elif [[ "$TAG" == "v${version}-rc."* && "${TAG#"v${version}-rc."}" =~ ^[0-9]+$ ]]; then
+            prerelease=true
+          else
+            printf 'Tag %s must be v%s or v%s-rc.N\n' "$TAG" "$version" "$version" >&2
+            exit 1
+          fi
+          printf 'version=%s\nprerelease=%s\n' "$version" "$prerelease" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: check-version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable and the target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET"
+      - name: Install the native musl C toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          printf 'CC_%s=musl-gcc\n' "${TARGET//-/_}" >> "$GITHUB_ENV"
+          target_env="$(printf '%s' "$TARGET" | tr '[:lower:]-' '[:upper:]_')"
+          printf 'CARGO_TARGET_%s_LINKER=musl-gcc\n' "$target_env" >> "$GITHUB_ENV"
+      # No build cache here: release artifacts are built from a clean state.
+      - run: cargo build --release --locked --target "$TARGET"
+      - name: Smoke test the binary
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET" == 'x86_64-apple-darwin' ]] && ! arch -x86_64 /usr/bin/true; then
+            echo 'Skipping Intel execution: Rosetta is unavailable on this runner.'
+            exit 0
+          fi
+          binary="target/$TARGET/release/snatchrs"
+          test "$("$binary" --version)" = "snatchrs $VERSION"
+          "$binary" index --from-file tests/fixtures/index.json --no-progress
+      - name: Require static Linux linkage
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          description="$(file "target/$TARGET/release/snatchrs")"
+          printf '%s\n' "$description"
+          printf '%s\n' "$description" | grep -Eq 'statically linked|static-pie linked'
+      - name: Package the binary and licenses
+        run: |
+          set -euo pipefail
+          name="snatchrs-$TAG-$TARGET"
+          mkdir -p "dist/$name"
+          install -m 755 "target/$TARGET/release/snatchrs" "dist/$name/snatchrs"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          if [[ "$RUNNER_OS" == 'Linux' ]]; then
+            tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+              -czf "dist/$name.tar.gz" -C dist "$name"
+          else
+            tar --uid 0 --gid 0 -czf "dist/$name.tar.gz" -C dist "$name"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: snatchrs-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      PRERELEASE: ${{ needs.check-version.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksum the archives
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Create the GitHub release
+        run: |
+          set -euo pipefail
+          options=(--verify-tag --title "$TAG" --generate-notes)
+          if [[ "$PRERELEASE" == true ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$TAG" "${options[@]}" dist/*.tar.gz dist/SHA256SUMS

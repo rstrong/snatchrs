@@ -104,3 +104,35 @@ ssh -t user@example.org './snatchrs index --from-file ~/snatchrs-fixture.json'
 remote test work without PyPI access. For live use, install the copied binary as
 `snatchrs` on the destination's PATH and follow the [README](../README.md).
 For unattended operation, see [long runs](operations.md#long-runs).
+
+## CI and releases
+
+CI runs on pushes to `main`, pull requests, and manual dispatch. Required-check
+names are `Lint (stable)`, `Test (ubuntu-latest, stable)`,
+`Test (macos-latest, stable)`, and `Build (MSRV)`. Lint checks formatting and
+Clippy; tests run on stable Rust on Linux and macOS. The MSRV job reads
+`rust-version` from Cargo.toml and builds all targets with that toolchain.
+The Linux-only `/dev/full` test is already gated; Unix tests also run on macOS.
+
+To prepare a release, update `version` in Cargo.toml and its matching package
+entry in Cargo.lock, then commit both files. Replace `X.Y.Z` below with that
+version, review CI, and create and push the matching tag:
+
+```sh
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+For a release candidate, keep Cargo.toml at the base version and use
+`vX.Y.Z-rc.N`, such as `v0.1.0-rc.1`. Other suffixes or mismatched versions fail
+the release tag check. Candidates are marked as prereleases and appear on the
+releases page rather than GitHub's latest stable release URL.
+
+The tag workflow builds Linux x86_64/ARM64 musl and macOS Apple Silicon/Intel
+archives. Linux builds must be static. Native binaries run version and saved-index
+smoke tests; the Intel Mac binary also runs if Rosetta is available. Each archive
+contains the binary, README, and both licenses in a named top-level directory.
+The publish job adds SHA256SUMS, attests the archives' build provenance, and
+creates a GitHub release with generated notes. macOS downloads are not Developer
+ID signed or notarized; follow the [install instructions](../README.md#install)
+for quarantine handling. No crates.io package is published.
