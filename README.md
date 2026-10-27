@@ -1,20 +1,22 @@
 # snatchrs
 
-Build a PyPI mirror with package files and a static Simple index. Serve it to pip
-and uv with any static web server, including on offline and air-gapped networks.
+snatchrs copies the PyPI projects you choose into a plain directory. Any static web
+server can then serve that directory to pip and uv. It is built for offline and
+air-gapped networks.
 
-- Mirror all versions of the projects you choose.
-- Check PyPI's SHA256 hashes while downloading, when supplied.
-- Rerun to fetch new, missing, or wrong-sized files.
-- Interrupt safely and rerun to continue.
-- Deploy a single binary.
+- It mirrors every version of each project you name.
+- It checks each file against PyPI's SHA256 hash while downloading, when PyPI
+  provides one.
+- A rerun downloads only new, missing or wrong-sized files.
+- You can stop it at any time and rerun it to continue.
+- It is a single binary.
 
-**Not included:** dependency resolution, version filtering, a caching proxy, or
-JSON index serving. The public index is HTML Simple API only.
+**Not included:** dependency resolution, version filtering, or a caching proxy.
+The mirror serves the HTML Simple API only, not the JSON one.
 
 ## Install
 
-Install Rust 1.89+ and Git, then run:
+You need Git and Rust 1.89 or newer.
 
 ```sh
 git clone https://github.com/rstrong/snatchrs && cd snatchrs
@@ -22,28 +24,30 @@ cargo install --locked --path .
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
-This installs `snatchrs` in `~/.cargo/bin`. The test below uses Python 3 and pip;
-uv is needed only for the uv examples.
+This puts `snatchrs` in `~/.cargo/bin`.
 <!-- TODO(release): add prebuilt binary download once the release workflow exists -->
 
 ## Quick start
 
-1. Mirror packaging. This creates package files, saved metadata, and index pages.
+1. Mirror one project:
 
    ```sh
    snatchrs mirror ./mirror --package packaging
    ```
 
-2. Serve it for a test. Leave this running while you try step 3.
+   This downloads every release of `packaging` into `./mirror` and writes the
+   index pages.
+
+2. Serve the mirror for a quick test, and leave it running:
 
    ```sh
    python3 -m http.server 8000 --directory ./mirror
    ```
 
-   This exposes the whole directory and is only for testing. Use the
-   [production configuration](#serve-it-properly) below for a shared server.
+   This serves the whole directory, so use it only for testing. For a shared
+   server, see [Serve it properly](#serve-it-properly).
 
-3. In another terminal, download from the mirror with pip, or install with uv.
+3. In a second terminal, download from the mirror with pip or uv:
 
    ```sh
    pip download --index-url http://localhost:8000/simple/ --no-deps -d /tmp/snatchrs-try packaging
@@ -52,8 +56,9 @@ uv is needed only for the uv examples.
 
 ## Mirror what your project needs
 
-snatchrs does **not** resolve dependencies. Name each project you need; it mirrors
-**every version** of each name. Use uv to resolve a requirements file first:
+snatchrs does **not** resolve dependencies. It mirrors only the projects you
+name, and it mirrors **every version** of each one. To get the full list for a
+project, resolve it with uv first:
 
 ```sh
 printf 'requests\n' > requirements.in
@@ -62,52 +67,66 @@ snatchrs check ./mirror --packages-file requirements.txt --json > check.json
 snatchrs mirror ./mirror --packages-file requirements.txt
 ```
 
-`check.json` contains counts and total expected bytes in `summary.expected_bytes`,
-without downloading files. That total includes files already present. From a
-working environment, `pip freeze > requirements.txt` is another way to list names.
-Pins, extras, and markers are ignored: all versions are mirrored. Hash-pinned
-lockfiles are not supported; compile without `--generate-hashes`.
+`check` looks up the projects without downloading anything.
+`summary.expected_bytes` in `check.json` is the total size of the selection,
+including files you already have.
 
-One measured requests + flask dependency set was 12 projects, 4,736 files, and
-about 790 MiB; your selection will differ. Repeat `--package NAME` for explicit
-names. `--all` selects all PyPI, which needs **many tens of TB**. See
-[package selection](docs/selecting-packages.md) for the four selection modes.
+Things to know about the package list:
+
+- `pip freeze > requirements.txt` in a working environment also gives you a list.
+- Version pins, extras and markers are ignored. Every version is mirrored.
+- Hash-pinned lockfiles aren't supported yet. Compile without `--generate-hashes`.
+
+Sizes add up quickly. `requests` and `flask` with their dependencies came to 12
+projects, 4,736 files and about 790 MiB.
+
+To name projects directly, repeat `--package NAME`. `--all` mirrors all of PyPI,
+which is **many tens of terabytes**. See
+[Selecting packages](docs/selecting-packages.md) for every option.
 
 ## Keep it up to date
 
-Rerun the same mirror command. It downloads new, missing, or wrong-sized files
-and rebuilds the pages. Use [scripts/run-mirror.sh](scripts/run-mirror.sh) from
-cron to record an exit status; see [scheduling](docs/operations.md#long-runs).
-Ctrl-C stops cleanly and saves progress reports; rerun to continue.
+Rerun the same `mirror` command. It downloads only new, missing or wrong-sized
+files, then rebuilds the index pages. To run it from cron, use
+[scripts/run-mirror.sh](scripts/run-mirror.sh), which records the exit status; see
+[Long runs](docs/operations.md#long-runs).
+
+Ctrl-C stops a run cleanly and saves its reports. Rerun to continue.
 
 | Exit | Meaning |
 | --- | --- |
 | 0 | Success. |
-| 1 | Something failed; reports are saved when possible. |
-| 2 | Command-line usage error. |
+| 1 | Something failed. Reports are saved when possible. |
+| 2 | The command line was invalid. |
 | 130 | Interrupted. |
 
-`check` returns 1 for package errors or blocked paths, but missing or wrong-sized
-files alone do not fail it. See [failure handling](docs/operations.md).
+`check` exits 0 when files are only missing or the wrong size. It exits 1 for
+project errors or blocked paths. See
+[Failures and exit codes](docs/operations.md#failures-and-exit-codes).
 
 ## Move it to an air-gapped network
 
-Copy the whole mirror. Replace `/media/usb` with your mounted transfer drive:
+Copy the whole mirror directory. Replace `/media/usb` with your transfer drive:
 
 ```sh
 rsync -a ./mirror/ /media/usb/mirror/
 snatchrs verify /media/usb/mirror
 ```
 
-Run `verify` and serve the directory on the offline side. Verification is offline
-and needs a writable mirror. Later rsync runs transfer only changes. Serving needs
-`simple/` and `packages/`; verification and index rebuilds also need `metadata/`.
-Copy everything except, optionally, `reports/`; old reports are not required.
+On the offline side, run `verify` and serve the directory. `verify` works
+offline, but it writes a report, so the mirror must be writable. Later `rsync`
+runs copy only what changed.
+
+| Directory | Needed for |
+| --- | --- |
+| `simple/`, `packages/` | Serving to pip and uv. |
+| `metadata/` | `verify`, and rebuilding the index with `simple`. |
+| `reports/` | Nothing. Copying it is optional. |
 
 ## Serve it properly
 
-Replace the example hostname and `/srv/pypi` with your host and mirror path.
-This nginx configuration exposes only the two public trees:
+This nginx configuration exposes only the index and package files. Replace the
+hostname and `/srv/pypi` with your own:
 
 ```nginx
 server {
@@ -121,7 +140,7 @@ server {
 }
 ```
 
-For pip, put this in `~/.config/pip/pip.conf`, using your actual hostname:
+Then point pip at it in `~/.config/pip/pip.conf`:
 
 ```ini
 [global]
@@ -129,32 +148,39 @@ index-url = http://mirror.example.org/simple/
 trusted-host = mirror.example.org
 ```
 
-For HTTPS with a valid certificate, use `https://` and omit `trusted-host`.
-See [serving](docs/serving.md) for permissions, HTTPS, and uv configuration.
+With HTTPS and a valid certificate, use `https://` and drop `trusted-host`. See
+[Serving](docs/serving.md) for file permissions, HTTPS and uv.
 
 ## Commands
 
-| Command | Purpose |
+| Command | What it does |
 | --- | --- |
-| `mirror` | Download selected projects and rebuild their index pages. |
-| `check` | Inspect selected projects without downloading files. |
-| `verify` | Check saved file sizes and SHA256 hashes offline. |
-| `simple` | Rebuild index pages from local metadata, offline. |
-| `index` | List projects from the upstream index. |
+| `mirror` | Downloads the selected projects and rebuilds their index pages. |
+| `check` | Looks up the selected projects and compares them with the mirror. Downloads nothing. |
+| `verify` | Checks file sizes and SHA256 hashes, offline. |
+| `simple` | Rebuilds the index pages from saved metadata, offline. |
+| `index` | Lists every project on the upstream index. |
 
-For `mirror`, `-j/--concurrency` defaults to 8 and `--min-free` keeps `1G` free.
-For `verify`, `-j` defaults to 4. `--quiet` suppresses status; `--no-progress`
-disables the dashboard. `--json` is available on every command except `simple`.
-Use `snatchrs <command> --help` for all options and required selections.
+Common options:
+
+| Option | Effect |
+| --- | --- |
+| `-j N` | Parallel downloads for `mirror` (default 8) or hashing for `verify` (default 4). |
+| `--min-free SIZE` | Free disk space `mirror` keeps in reserve (default `1G`). |
+| `--quiet` | Hides status messages. Results and errors still print. |
+| `--no-progress` | Prints plain status lines instead of the live display. |
+| `--json` | Prints the result as JSON. Not available on `simple`. |
+
+Run `snatchrs <command> --help` for the full list.
 
 ## Documentation
 
-- [Selecting packages](docs/selecting-packages.md): names, files, sampling, caches.
-- [Serving](docs/serving.md): nginx, pip, uv, permissions, and HTTPS.
-- [Operations](docs/operations.md): disk space, retries, proxies, repair, scheduling.
-- [Reports](docs/reports.md): layout, JSONL fields, and retention.
-- [How it works](docs/how-it-works.md): inspection, downloads, and integrity checks.
-- [Development](docs/development.md): building, testing, and copying a binary.
+- [Selecting packages](docs/selecting-packages.md): package lists, sampling and the metadata cache.
+- [Serving](docs/serving.md): nginx, pip, uv, permissions and HTTPS.
+- [Operations](docs/operations.md): disk space, retries, proxies, repair and scheduling.
+- [Reports](docs/reports.md): the directory layout, report fields and retention.
+- [How it works](docs/how-it-works.md): the download pipeline and integrity checks.
+- [Development](docs/development.md): building, testing and copying a binary.
 
 ## License
 
