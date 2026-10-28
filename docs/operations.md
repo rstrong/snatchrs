@@ -159,6 +159,30 @@ errors; there is no fallback around a failed proxy. Transport follows
 [reqwest's environment proxy behavior](https://docs.rs/reqwest/0.12.28/reqwest/#proxies).
 See [proxy tests](development.md#checks) for isolated local regression tests.
 
+## Certificates and TLS interception
+
+snatchrs trusts the OS certificate store plus a bundled Mozilla root list.
+A corporate CA installed system-wide (for example, with Ubuntu's
+`update-ca-certificates`) works automatically, including behind a TLS-intercepting
+proxy. Minimal hosts without a system CA bundle still have the Mozilla roots.
+
+For a CA that is not installed system-wide, set `SSL_CERT_FILE` to a PEM bundle
+or `SSL_CERT_DIR` to directories containing PEM certificates before running
+snatchrs:
+
+```sh
+SSL_CERT_FILE=/path/to/corporate-ca.pem snatchrs mirror ./mirror --package packaging
+```
+
+These variables work on Linux, macOS, and Windows. Setting either replaces
+the platform-store lookup with the specified locations; setting both loads both.
+`SSL_CERT_DIR` accepts a colon-separated list on Unix and a semicolon-separated
+list on Windows. Directories are scanned without recursion. These overrides
+do not replace the bundled Mozilla roots, which remain trusted.
+
+Certificate validation is always enabled and cannot be disabled. Proxy routing
+continues to follow the environment variables described above.
+
 ## Verify and repair
 
 ```sh
